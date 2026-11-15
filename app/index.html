@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PotScope — live make.fun bounty board</title>
+<meta name="description" content="PotScope: live make.fun bounty board, bounty pages, leaderboards and builder profiles.">
+<meta name="color-scheme" content="light">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="#/" aria-label="PotScope board">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="brand-name">PotScope</span>
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="#/" data-nav="board">Board</a>
+      <a href="#/builders" data-nav="builders">Top builders</a>
+    </nav>
+    <form class="search" id="search-form" role="search">
+      <input id="search-input" type="search" placeholder="Search bounties or @handle" autocomplete="off" aria-label="Search bounties or @handle">
+    </form>
+    <div class="clock" id="clock" aria-label="UTC clock">--:--:--</div>
+  </div>
+</header>
+
+<div class="ticker" id="ticker" aria-live="polite">
+  <div class="wrap ticker-row"><span class="ticker-label">LIVE</span><span class="ticker-text" id="ticker-text">Connecting to make.fun…</span></div>
+</div>
+
+<main class="wrap" id="view" tabindex="-1"></main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <span>PotScope · read-only view of <a href="https://make.fun" rel="noopener">make.fun</a> public data</span>
+    <span id="foot-status">1 request per view · cached 60s</span>
+  </div>
+</footer>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
