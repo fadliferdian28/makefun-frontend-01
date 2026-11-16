@@ -1,8 +1,9 @@
-// leaderboard.js — lazy-loaded full board: 50 rows a page, handle search,
-// metric-adaptive score column + 90% interval, prize and received columns.
+// leaderboard.js — lazy-loaded per-bounty board (50 rows a page, handle search,
+// metric-adaptive score column + 90% interval, medals for the top 3) and the
+// top-builders surface (rank medals, win rate, entries, rewards).
 
-import { getLeaderboard } from "../api.js";
-import { num, score, intervalRange, money2, dateShort, el, avatar, apiUrl } from "../format.js";
+import { getLeaderboard, getTopBuilders } from "../api.js";
+import { num, score, intervalRange, money2, money, dateShort, pct, el, avatar, apiUrl } from "../format.js";
 
 const PAGE_SIZE = 50;
 
@@ -100,6 +101,17 @@ function scoreText(value, label, unit) {
   return score(value, label, unit);
 }
 
+const MEDALS = { 1: "gold", 2: "silver", 3: "bronze" };
+
+function rankCell(rank, cls) {
+  const n = Number(rank);
+  if (MEDALS[n]) {
+    return el("td", { class: "rank" + (cls ? " " + cls : "") },
+      el("span", { class: "medal " + MEDALS[n], title: "#" + n + " place" }, String(n)));
+  }
+  return el("td", { class: "rank" + (cls ? " " + cls : "") }, "#" + num(rank));
+}
+
 function buildHead(b, columns, rankKey) {
   const label = metricLabel(rankKey, columns, b);
   return el("thead", null, el("tr", null,
@@ -129,7 +141,7 @@ function buildBody(b, rows, columns, rankKey, unit) {
     const prizeText = prize !== null ? money2(prize) : "—";
     const value = rowValue(r, rankKey);
     tbody.append(el("tr", null,
-      el("td", { class: "rank" + (r.rank <= 3 ? " top" : "") }, "#" + num(r.rank)),
+      rankCell(r.rank, r.rank <= 3 ? "top" : ""),
       el("td", null, el("div", { class: "entrant" }, img,
         el("div", { class: "et" },
           el("a", { class: "h", href: "#/u/" + encodeURIComponent(r.handle) }, "@" + (r.handle || "")),
@@ -301,6 +313,93 @@ export async function render(container, ctx = {}) {
     container.replaceChildren(el("div", { class: "err" },
       "Could not load this leaderboard. ", el("a", { href: "#/bounty/" + encodeURIComponent(slug) }, "Back to the bounty")));
     throw err;
+  }
+}
+
+// ---- Top builders surface (#/builders) ----
+
+function builderRank(rank) {
+  const n = Number(rank);
+  if (MEDALS[n]) return el("span", { class: "medal " + MEDALS[n], title: "#" + n + " place" }, String(n));
+  return el("span", { class: "muted", style: "font-variant-numeric:tabular-nums;font-weight:700" }, "#" + num(rank));
+}
+
+function winRate(rec) {
+  const entered = Number(rec.competitions_entered) || 0;
+  const won = Number(rec.competitions_won) || 0;
+  if (!entered) return "—";
+  return pct((won / entered) * 100, 1);
+}
+
+export async function renderBuilders(container) {
+  container.replaceChildren(el("div", { class: "loading" }, "Loading top builders…"));
+  try {
+    const { body } = await getTopBuilders();
+    const items = Array.isArray(body.items) ? body.items : [];
+
+    const head = el("div", { class: "lb-head" },
+      el("h1", null, "Leaderboard"),
+      el("div", { class: "muted", style: "font-size:13px;width:100%" }, "Top builders on make.fun"),
+    );
+
+    // The rankings API has no time dimension: the pills are visual only and
+    // "All Time" stays selected. No data is invented.
+    const filters = el("div", { class: "toggle", role: "group", "aria-label": "Time range" });
+    for (const label of ["All Time", "This Month", "This Week"]) {
+      filters.append(el("button", {
+        type: "button",
+        "aria-pressed": label === "All Time" ? "true" : "false",
+        title: label === "All Time" ? "" : "Time filtering is unavailable from the API",
+      }, label));
+    }
+    filters.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      for (const b2 of filters.children) b2.setAttribute("aria-pressed", String(b2 === btn));
+    });
+
+    const tbody = el("tbody");
+    for (const row of items) {
+      const rec = row.record || {};
+      const img = row.image
+        ? avatar(apiUrl(row.image), 26, row.handle)
+        : el("span", { class: "avatar", "aria-hidden": "true", style: "display:inline-block;width:26px;height:26px" });
+      tbody.append(el("tr", null,
+        el("td", { class: "rank" }, builderRank(row.rank)),
+        el("td", null, el("div", { class: "entrant" }, img,
+          el("div", { class: "et" },
+            el("a", { class: "h", href: "#/u/" + encodeURIComponent(row.handle) },
+              row.display_name || ("@" + row.handle),
+              row.verified === true ? el("span", { class: "chk", title: "Verified" }, " ✓") : null),
+            el("div", { class: "ti" }, "@" + (row.handle || "")),
+          ))),
+        el("td", { class: "right" }, winRate(rec)),
+        el("td", { class: "right hidesm muted", title: "Not provided by the API" }, "—"),
+        el("td", { class: "right" }, num(rec.competitions_entered)),
+        el("td", { class: "right" }, el("span", { class: "money" }, money(rec.prize_usd))),
+        el("td", { class: "right" }, el("a", { class: "btn ghost sm", href: "#/u/" + encodeURIComponent(row.handle) }, "View")),
+      ));
+    }
+
+    const table = el("table", null,
+      el("thead", null, el("tr", null,
+        el("th", null, "Rank"), el("th", null, "Builder"),
+        el("th", { class: "right" }, "Win rate"), el("th", { class: "right hidesm" }, "90% CI"),
+        el("th", { class: "right" }, "Entries"), el("th", { class: "right" }, "Rewards"),
+        el("th", { class: "right" }, ""),
+      )),
+      tbody,
+    );
+
+    const frag = el("div", null,
+      head,
+      el("div", { class: "lb-tools" }, filters),
+      items.length ? el("div", { class: "tablewrap" }, table) : el("div", { class: "empty" }, "No builders ranked yet."),
+    );
+    container.replaceChildren(frag);
+  } catch {
+    container.replaceChildren(el("div", { class: "err" }, "Could not load top builders."));
+    throw new Error("builders failed");
   }
 }
 
