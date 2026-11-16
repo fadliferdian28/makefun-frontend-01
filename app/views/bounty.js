@@ -1,30 +1,61 @@
-// bounty.js — bounty detail: stat cards, rewards table with fee-share bars,
-// dates timeline, judging, top-5 preview, rules, winner card.
+// bounty.js — bounty detail: emerald hero header, live stat strip, in-page
+// tabs (Overview/Leaderboard/Rules/Rewards/Activity) and a rewards sidebar.
 
 import { getBounty, getLive } from "../api.js";
 import {
-  money, money2, num, countdown, dateShort, dateTimeShort, timeShort, score,
-  esc, el, avatar, apiUrl, placeLabel, markdownToHtml,
+  money2, num, countdown, dateTimeShort, esc, el, apiUrl, placeLabel, markdownToHtml,
 } from "../format.js";
 
 let countdownTimer = null;
+
+function svg(paths, extra) {
+  const ns = "http://www.w3.org/2000/svg";
+  const node = document.createElementNS(ns, "svg");
+  node.setAttribute("viewBox", "0 0 24 24");
+  node.setAttribute("fill", "none");
+  node.setAttribute("stroke", "currentColor");
+  node.setAttribute("stroke-width", "1.8");
+  node.setAttribute("stroke-linecap", "round");
+  node.setAttribute("stroke-linejoin", "round");
+  node.setAttribute("aria-hidden", "true");
+  if (extra) for (const [k, v] of Object.entries(extra)) node.setAttribute(k, v);
+  for (const d of paths) {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d);
+    node.append(p);
+  }
+  return node;
+}
+
+const ICONS = {
+  pot: ["M4 7h16v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7z", "M4 7l2-3h12l2 3", "M9 12h6"],
+  fee: ["M12 2v20", "M17 6.5c0-1.7-2.2-3-5-3s-5 1.3-5 3 2.2 3 5 3 5 1.3 5 3-2.2 3-5 3-5-1.3-5-3"],
+  clock: ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z", "M12 6v6l4 2"],
+  entries: ["M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2", "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z", "M23 21v-2a4 4 0 0 0-3-3.87", "M16 3.13a4 4 0 0 1 0 7.75"],
+  code: ["M8 9l-3 3 3 3", "M16 9l3 3-3 3", "M14 6l-4 12"],
+  share: ["M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7", "M16 6l-4-4-4 4", "M12 2v13"],
+  trophy: ["M8 21h8", "M12 17v4", "M7 4h10v5a5 5 0 0 1-10 0V4z", "M7 6H4a3 3 0 0 0 3 3", "M17 6h3a3 3 0 0 1-3 3"],
+};
 
 function statusOf(b) {
   const now = Date.now();
   const deadline = Date.parse(b.deadline || 0);
   const resolved = b.winner || b.status === "resolved" || b.resolvedAt;
   if (resolved) return { key: "resolved", label: "Resolved" };
-  if (b.acceptingSubmissions === true && deadline > now) return { key: "live", label: "Takes entries" };
-  if (b.acceptingSubmissions === false && deadline > now) return { key: "closed", label: "Closed" };
-  if (deadline > now) return { key: "live", label: "Takes entries" };
-  return { key: "closed", label: "Closed" };
+  if (b.acceptingSubmissions === true && deadline > now) return { key: "live", label: "LIVE BOUNTY" };
+  if (b.acceptingSubmissions === false && deadline > now) return { key: "closed", label: "CLOSED" };
+  if (deadline > now) return { key: "live", label: "LIVE BOUNTY" };
+  return { key: "closed", label: "CLOSED" };
 }
 
-function statCard(k, v, sub, cls) {
-  return el("div", { class: "stat" },
-    el("div", { class: "k" }, k),
-    el("div", { class: "v" + (cls ? " " + cls : "") }, v),
-    sub ? el("div", { class: "sub" }, sub) : null,
+function statCard(icon, k, v, sub, cls) {
+  return el("div", { class: "stat-card" },
+    el("div", { class: "icon" }, svg(ICONS[icon] || ICONS.pot)),
+    el("div", { class: "st-body" },
+      el("div", { class: "k" }, k),
+      el("div", { class: "v" + (cls ? " " + cls : "") }, v),
+      sub ? el("div", { class: "sub", style: "font-size:11px;color:var(--muted);margin-top:2px" }, sub) : null,
+    ),
   );
 }
 
@@ -45,7 +76,7 @@ function rewardRow(r, max, index) {
   const width = (total / max) * 100;
   const baseShare = total ? (base / total) * 100 : 100;
   const feeShare = total ? (fee / total) * 100 : 0;
-  const tr = el("tr", { class: index === 0 ? "place1" : "" },
+  return el("tr", { class: index === 0 ? "place1" : "" },
     el("td", null, placeLabel(r.place)),
     el("td", { class: "right" }, money2(r.baseUsd)),
     el("td", { class: "right" }, money2(r.feeShareUsd)),
@@ -56,11 +87,11 @@ function rewardRow(r, max, index) {
         el("span", { class: "fee", style: "width:" + feeShare.toFixed(2) + "%" }),
       )),
   );
-  return tr;
 }
 
-function rewardsPanel(b) {
+function rewardsTable(b) {
   const { list, max } = rewardsRows(b);
+  if (!list.length) return el("div", { class: "muted", style: "font-size:12px" }, "No rewards published.");
   const visible = list.slice(0, 10);
   const rest = list.slice(10);
   const tbody = el("tbody", null, ...visible.map((r, i) => rewardRow(r, max, i)));
@@ -73,17 +104,7 @@ function rewardsPanel(b) {
     )),
     tbody, restBody,
   );
-  const feeTotal = Number(b.entryFeesUsd) || 0;
-  const baseTotal = Number(b.rewardAmount) || 0;
-  const math = el("div", { class: "muted", style: "font-size:12px;margin-bottom:8px" },
-    money2(baseTotal) + " base + " + money2(feeTotal) + " from " + num(b.entryFeePayers || 0) + " entry fees = ",
-    el("span", { class: "money" }, money2(b.potUsd)),
-  );
-  const panel = el("div", { class: "panel" },
-    el("h2", null, "Rewards · live pot math"),
-    math,
-    el("div", { class: "tablewrap" }, table),
-  );
+  const wrap = el("div", null, el("div", { class: "tablewrap" }, table));
   if (rest.length) {
     const btn = el("button", { class: "pill", type: "button", style: "margin-top:8px" }, "Show all " + list.length + " places");
     btn.addEventListener("click", () => {
@@ -91,92 +112,88 @@ function rewardsPanel(b) {
       restBody.hidden = !open;
       btn.textContent = open ? "Show top 10 only" : "Show all " + list.length + " places";
     });
-    panel.append(btn);
+    wrap.append(btn);
   }
-  return panel;
+  return wrap;
 }
 
-function timelinePanel(b) {
-  const now = Date.now();
-  const phases = Array.isArray(b.phases) ? b.phases : [];
-  const opened = b.opensAt || b.publishedAt;
-  const finalPhase = phases.find((p) => p.key === "final") || phases[phases.length - 1];
-  const rows = [];
-  const tl = (title, when, detail, state) => el("div", { class: "tl " + (state || "") },
-    el("span", { class: "dotl" }),
-    el("div", null,
-      el("div", { class: "t" }, title),
-      el("div", { class: "d" }, when + (detail ? " · " + detail : "")),
+function rewardsPanel(b) {
+  const feeTotal = Number(b.entryFeesUsd) || 0;
+  const baseTotal = Number(b.rewardAmount) || 0;
+  return el("div", { class: "panel" },
+    el("h2", null, "Rewards · live pot math"),
+    el("div", { class: "muted", style: "font-size:12px;margin-bottom:8px" },
+      money2(baseTotal) + " base + " + money2(feeTotal) + " from " + num(b.entryFeePayers || 0) + " entry fees = ",
+      el("span", { class: "money" }, money2(b.potUsd)),
     ),
+    rewardsTable(b),
   );
-  if (opened) rows.push(tl("Opened", dateTimeShort(opened), "", Date.parse(opened) <= now ? "done" : ""));
-  rows.push(tl("Deadline", dateTimeShort(b.deadline), Date.parse(b.deadline) > now ? "entries close" : "entries closed", Date.parse(b.deadline) <= now ? "done" : "now"));
-  if (finalPhase && finalPhase.endsAt) rows.push(tl("Results by", dateTimeShort(finalPhase.endsAt), "final window ends", Date.parse(finalPhase.endsAt) <= now ? "done" : ""));
-  const phaseList = el("div", { class: "timeline", style: "margin-top:10px" });
-  for (const p of phases) {
-    const state = Date.parse(p.startsAt) <= now && (!p.endsAt || Date.parse(p.endsAt) > now) ? "now" : Date.parse(p.endsAt || 0) <= now ? "done" : "";
-    phaseList.append(tl(
-      (p.title || p.key) + (p.scores === "live" ? " · scores live" : p.scoresVisible ? "" : " · scores held"),
-      (p.startsAt ? timeShort(p.startsAt) : "—") + " → " + (p.endsAt ? timeShort(p.endsAt) : "—"),
-      p.scores === "live" ? "scored as entries arrive" : "scored after finalize",
-      state,
+}
+
+function firstLine(b) {
+  const text = String(b.summary || b.description || "").split(/\r?\n/)
+    .map((s) => s.replace(/^[#>*\-\s]+/, "").trim())
+    .find(Boolean);
+  return text ? text.slice(0, 180) : "";
+}
+
+function deliverables(b) {
+  const source = b.description || "";
+  const items = [];
+  for (const line of source.split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/);
+    if (m) items.push(m[1].replace(/\*\*/g, "").trim());
+  }
+  if (!items.length && b.rules) {
+    for (const line of String(b.rules).split(/\r?\n/)) {
+      const m = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/);
+      if (m) items.push(m[1].replace(/\*\*/g, "").trim());
+    }
+  }
+  if (!items.length) return el("div", { class: "muted", style: "font-size:12px" }, "No deliverables listed.");
+  return el("ul", { class: "checklist" }, ...items.slice(0, 10).map((t) => el("li", null, t)));
+}
+
+function activityPanel(rows) {
+  const panel = el("div", { class: "panel" }, el("h2", null, "Recent activity"));
+  if (!rows || !rows.length) {
+    panel.append(el("div", { class: "muted", style: "font-size:12px" }, "No entries yet."));
+    return panel;
+  }
+  const list = el("div", { class: "act-list" });
+  for (const r of rows) {
+    list.append(el("div", { class: "act-item" },
+      el("span", { class: "act-dot" }),
+      el("div", { class: "act-t" },
+        el("div", null, "Entered ", el("a", { href: "#/u/" + encodeURIComponent(r.handle || "") }, "@" + (r.handle || "builder"))),
+        el("div", { class: "act-m" }, r.title || r.entry_title || "Entry submitted"),
+      ),
+      el("span", { class: "act-x" }, r.received_at ? dateTimeShort(r.received_at) : ""),
     ));
   }
-  return el("div", { class: "panel" },
-    el("h2", null, "Dates"),
-    el("div", { class: "timeline" }, ...rows),
-    phaseList,
-  );
-}
-
-function judgedPanel(b) {
-  const res = b.resolution || {};
-  const criteria = Array.isArray(res.criteria) ? res.criteria : [];
-  const metric = res.metric || {};
-  return el("div", { class: "panel judge" },
-    el("h2", null, "How it is judged"),
-    el("p", { class: "lede" }, res.summary || "No judging notes published."),
-    criteria.length ? el("ul", null, ...criteria.slice(0, 8).map((c) => el("li", null, c))) : null,
-    el("div", { class: "metric" },
-      "Metric: ", el("b", null, metric.name || b.leaderboard && b.leaderboard.rankKey || "Score"),
-      metric.unit ? " (" + metric.unit + ", " + (metric.better || "higher") + " is better)" : "",
-    ),
-  );
-}
-
-function livePreview(b, live, onLoaded) {
-  const panel = el("div", { class: "panel" },
-    el("div", { style: "display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap" },
-      el("h2", null, "Top 5 entries"),
-      el("a", { href: "#/bounty/" + encodeURIComponent(b.slug) + "/leaderboard", style: "font-size:12px" }, "Full leaderboard →"),
-    ),
-  );
-  const standings = live && live.standings ? live.standings : null;
-  if (!standings) {
-    panel.append(el("div", { class: "loading", style: "padding:10px" }, "Loading standings…"));
-    return panel;
-  }
-  if (standings.scores_visible === false || !standings.rows || !standings.rows.length) {
-    panel.append(el("div", { class: "held", style: "margin:6px 0" }, "Scores held until the final run."));
-    return panel;
-  }
-  const metricName = standings.rank_key_title || (b.resolution && b.resolution.metric && b.resolution.metric.name) || "";
-  const unit = b.resolution && b.resolution.metric ? b.resolution.metric.unit : "";
-  const table = el("table", { class: "mini" },
-    el("thead", null, el("tr", null,
-      el("th", null, "Rank"), el("th", null, "Entrant"), el("th", null, "Entry"),
-      el("th", { class: "right" }, metricName || "Score"),
-    )),
-    el("tbody", null, ...standings.rows.slice(0, 5).map((r) => el("tr", null,
-      el("td", { class: "rank" }, "#" + num(r.rank)),
-      el("td", null, el("a", { href: "#/u/" + encodeURIComponent(r.handle) }, "@" + (r.handle || ""))),
-      el("td", { class: "hidesm", style: "max-width:38ch" }, r.title || "—"),
-      el("td", { class: "right score" }, score(r.value, metricName, unit)),
-    ))),
-  );
-  panel.append(el("div", { class: "tablewrap" }, table));
-  if (onLoaded) onLoaded();
+  panel.append(list);
   return panel;
+}
+
+function sidebar(b, st) {
+  const rewards = b.rewardsNow || [];
+  const first = rewards.length ? Math.max(...rewards.map((r) => Number(r.amountUsd) || 0)) : null;
+  return el("div", { class: "side" },
+    el("div", { class: "panel" },
+      el("div", { class: "k muted", style: "font-size:11px;text-transform:uppercase;letter-spacing:.06em" }, "Live pot"),
+      el("div", { class: "sp" }, money2(b.potUsd)),
+      el("div", { class: "sd" }, "+ " + num(b.submissionCount) + " entries" + (first !== null ? " · top prize " + money2(first) : "")),
+      el("div", { style: "margin-top:12px" },
+        el("div", { class: "db" }, el("span", { class: "k" }, "Opens"), el("span", { class: "v" }, dateTimeShort(b.opensAt || b.publishedAt))),
+        el("div", { class: "db" }, el("span", { class: "k" }, "Closes"), el("span", { class: "v" }, dateTimeShort(b.deadline))),
+        el("div", { class: "db" }, el("span", { class: "k" }, "Status"),
+          el("span", { class: "v", style: "display:inline-flex;align-items:center;gap:6px" },
+            el("span", { class: "dot", style: "width:7px;height:7px;border-radius:50%;background:" + (st.key === "live" ? "var(--emerald-fill)" : "var(--faint)") }),
+            st.key === "live" ? "Live" : st.label,
+          )),
+      ),
+    ),
+  );
 }
 
 function winnerPanel(b) {
@@ -197,6 +214,14 @@ function winnerPanel(b) {
   );
 }
 
+function tabButton(name, label, active) {
+  return el("button", { type: "button", role: "tab", "aria-selected": active ? "true" : "false", "data-tab": name }, label);
+}
+
+function tabPanel(name, ...children) {
+  return el("div", { class: "tab-panel", "data-panel": name, role: "tabpanel", hidden: name !== "overview" }, ...children);
+}
+
 export async function render(container, ctx = {}) {
   const slug = ctx.params && ctx.params.slug;
   if (!slug) {
@@ -210,68 +235,122 @@ export async function render(container, ctx = {}) {
     const { body: b, stale, refreshFailed } = await getBounty(slug);
     const st = statusOf(b);
     const fee = b.entryFeeUsd === null || b.entryFeeUsd === undefined ? "FREE" : money2(b.entryFeeUsd);
-    const liveEl = el("div", { id: "bounty-countdown" }, countdown(b.deadline));
-    const head = el("div", null,
-      el("div", { class: "crumb" }, el("a", { href: "#/" }, "Board"), " / ", esc(b.category || "Bounty")),
-      el("div", { class: "bhead" },
+    const isLive = st.key === "live";
+
+    const head = el("div", { class: "bhero" },
+      el("div", { class: "bh-text" },
+        el("div", { class: "badges" },
+          el("span", { class: isLive ? "livepill" : "closedpill" }, isLive ? "LIVE BOUNTY" : "CLOSED"),
+          b.entryFeeUsd !== null && b.entryFeeUsd !== undefined && Number(b.entryFeeUsd) > 0 ? el("span", { class: "badge paid" }, "Paid entry") : null,
+          b.category ? el("span", { class: "pillcat" }, b.category) : null,
+        ),
         el("h1", null, b.title || slug),
-        el("span", { class: "badge " + st.key }, st.label),
-        b.entryFeeUsd !== null && b.entryFeeUsd !== undefined && Number(b.entryFeeUsd) > 0 ? el("span", { class: "badge paid" }, "Paid entry") : null,
+        el("div", { class: "b-sub" }, firstLine(b) || "Build, compete, and win rewards on make.fun."),
       ),
-      el("div", { class: "muted", style: "font-size:12px" },
-        "by " + (b.sponsor ? b.sponsor.name : "make.fun"),
-        b.skills && b.skills.length ? " · " + b.skills.join(" · ") : "",
-        " · " + num(b.submissionCount) + " entries",
-      ),
+      el("div", { class: "bh-icon" }, svg(ICONS.code, { stroke: "#fff" })),
     );
 
-    const stats = el("div", { class: "stats" },
-      statCard("Live pot", money2(b.potUsd), money2(b.rewardAmount) + " base + " + money2(b.entryFeesUsd) + " fees", "money"),
-      statCard("Entry fee", fee, b.entryFeeUsd === null ? "no fee to enter" : num(b.entryFeePayers || 0) + " paid entries"),
-      statCard("Time left", "", "", ""),
-      statCard("Entries", num(b.submissionCount), b.submissionsPassed !== undefined ? num(b.submissionsPassed) + " passed" : "accepted entries"),
+    const stats = el("div", { class: "statgrid" },
+      statCard("pot", "Live pot", money2(b.potUsd), money2(b.rewardAmount) + " base + " + money2(b.entryFeesUsd) + " fees", "money"),
+      statCard("fee", "Entry fee", fee, b.entryFeeUsd === null || b.entryFeeUsd === undefined ? "no fee to enter" : num(b.entryFeePayers || 0) + " paid entries"),
+      statCard("clock", "Time left", el("span", { id: "stat-countdown" }, countdown(b.deadline)), "deadline " + dateTimeShort(b.deadline)),
+      statCard("entries", "Entries", num(b.submissionCount), b.submissionsPassed !== undefined ? num(b.submissionsPassed) + " passed" : "accepted entries"),
     );
-    stats.children[2].replaceChildren(el("div", { class: "k" }, "Time left"), el("div", { class: "v", id: "stat-countdown" }, countdown(b.deadline)), el("div", { class: "sub" }, "deadline " + dateTimeShort(b.deadline)));
+
+    const shareLabel = el("span", null, " Share");
+    const shareBtn = el("button", { class: "btn ghost", type: "button", title: "Copy this page's URL" }, svg(ICONS.share, { width: "14", height: "14" }), shareLabel);
+    shareBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(location.href);
+        shareLabel.textContent = " Copied!";
+      } catch {
+        shareLabel.textContent = " Copy failed";
+      }
+      setTimeout(() => { shareLabel.textContent = " Share"; }, 1600);
+    });
 
     const actions = el("div", { class: "actions" },
-      el("a", { class: "btn", href: "https://make.fun/bounty/" + encodeURIComponent(slug), rel: "noopener" }, "Enter on make.fun"),
-      el("a", { class: "btn ghost", href: "#/bounty/" + encodeURIComponent(slug) + "/leaderboard" }, "Leaderboard"),
+      el("a", { class: "btn", href: "https://make.fun/bounty/" + encodeURIComponent(slug), rel: "noopener" }, "Enter Bounty"),
+      el("a", { class: "btn ghost", href: "#/bounty/" + encodeURIComponent(slug) + "/leaderboard" }, "View Leaderboard"),
+      shareBtn,
       b.kit && b.kit.tarball ? el("a", { class: "btn link", href: apiUrl(b.kit.tarball), rel: "noopener" }, "Download kit") : null,
       b.url ? el("a", { class: "btn link", href: apiUrl(b.url), rel: "noopener" }, "View on make.fun") : null,
     );
 
-    const intro = el("div", null,
-      b.summary ? el("p", { class: "lede" }, b.summary) : null,
-      b.description ? el("div", { class: "desc md", html: markdownToHtml(b.description) }) : null,
+    const overview = tabPanel("overview",
+      el("div", { class: "panel" },
+        el("h2", null, "About this bounty"),
+        b.description ? el("div", { class: "desc md", html: markdownToHtml(b.description) }) : el("div", { class: "muted", style: "font-size:12px" }, "No description published."),
+      ),
+      el("div", { class: "panel" },
+        el("h2", null, "Deliverables"),
+        deliverables(b),
+      ),
+      rewardsPanel(b),
+      winnerPanel(b) || "",
     );
 
-    const previewHost = el("div", null, livePreview(b, null));
-    const rules = el("details", { class: "rules" },
-      el("summary", null, "Rules (" + ((b.rules || "").length ? num(b.rules.length) + " characters" : "full text") + ")"),
-      el("div", { class: "rulebody md", html: b.rules ? markdownToHtml(b.rules) : "No rules published." }),
+    const leaderboardTab = tabPanel("leaderboard",
+      el("div", { class: "panel" },
+        el("h2", null, "Leaderboard"),
+        el("p", { class: "muted", style: "font-size:12px" }, "See every ranked entry, prizes, and confidence intervals on the full board."),
+        el("a", { class: "btn", href: "#/bounty/" + encodeURIComponent(slug) + "/leaderboard" }, "Open full leaderboard"),
+      ),
     );
+
+    const rulesTab = tabPanel("rules",
+      el("div", { class: "panel" },
+        el("h2", null, "Rules"),
+        el("div", { class: "rulebody md", html: b.rules ? markdownToHtml(b.rules) : "No rules published." }),
+      ),
+    );
+
+    const rewardsTab = tabPanel("rewards", rewardsPanel(b));
+
+    const activityHost = tabPanel("activity");
+    const activityBody = activityPanel(null);
+    activityHost.append(activityBody);
+
+    const tabs = el("div", { class: "tabs", role: "tablist" },
+      tabButton("overview", "Overview", true),
+      tabButton("leaderboard", "Leaderboard", false),
+      tabButton("rules", "Rules", false),
+      tabButton("rewards", "Rewards", false),
+      tabButton("activity", "Activity", false),
+    );
+    const panels = el("div", null, overview, leaderboardTab, rulesTab, rewardsTab, activityHost);
+    tabs.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-tab]");
+      if (!btn) return;
+      const name = btn.getAttribute("data-tab");
+      for (const b2 of tabs.children) b2.setAttribute("aria-selected", String(b2 === btn));
+      for (const p of panels.children) p.hidden = p.getAttribute("data-panel") !== name;
+    });
+
+    const main = el("div", { class: "main" }, tabs, panels);
+    const cols = el("div", { class: "cols" }, main, sidebar(b, st));
 
     const frag = document.createDocumentFragment();
     if (refreshFailed) frag.append(el("div", { class: "offline" }, "Could not refresh — showing the cached bounty."));
-    frag.append(head, stats, actions, intro, winnerPanel(b) || "", rewardsPanel(b), el("div", { class: "cols" }, timelinePanel(b), judgedPanel(b)), previewHost, rules);
+    frag.append(
+      el("div", { class: "crumb" }, el("a", { href: "#/" }, "Board"), " / ", esc(b.category || "Bounty")),
+      head, stats, actions, cols,
+    );
     container.replaceChildren(frag);
 
     countdownTimer = setInterval(() => {
       const a = document.getElementById("stat-countdown");
       if (a) a.textContent = countdown(b.deadline);
-      const c = document.getElementById("bounty-countdown");
-      if (c) c.textContent = countdown(b.deadline);
     }, 1000);
 
-    // Second request only for the top-5 standings strip.
+    // Reuse the existing live-standings request for the Activity tab.
     try {
       const { body: live } = await getLive(slug);
-      const fresh = livePreview(b, live);
-      previewHost.replaceChildren(fresh);
+      const rows = live && live.standings && Array.isArray(live.standings.rows) ? live.standings.rows.slice() : [];
+      rows.sort((a, c) => Date.parse(c.received_at || 0) - Date.parse(a.received_at || 0));
+      activityHost.replaceChildren(activityPanel(rows.slice(0, 5)));
     } catch {
-      previewHost.replaceChildren(el("div", { class: "panel" },
-        el("h2", null, "Top 5 entries"),
-        el("div", { class: "muted", style: "font-size:12px" }, "Standings unavailable right now.")));
+      activityHost.replaceChildren(activityPanel([]));
     }
     if (stale) { /* already showing data */ }
     return () => { if (countdownTimer) clearInterval(countdownTimer); countdownTimer = null; };
