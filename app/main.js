@@ -1,204 +1,246 @@
-import { render as renderBoard, setSearch, stopTicker } from "./views/board.js";
+// PotScope entry script: hash router, header wiring, and the shot-ready flag.
+//
+// View contract: every view module exports one async render function that
+// receives (root, context) and resolves once its data has painted.
+//   board.js     renderBoard(root, context)
+//   bounty.js    renderBounty(root, context)     context.slug
+//   leaderboard  renderLeaderboard(root, context) context.slug
+//                renderBuilders(root, context)
+//   profile.js   renderProfile(root, context)    context.handle
+// The context carries the parsed route, the abort signal for the visit, a
+// setTitle helper, a navigate helper, and isActive for polling guards.
 
-const view = document.getElementById("view");
-let cleanup = null;
-let routeToken = 0;
+import { fetchBoard } from './api.js';
+import { formatDateTime } from './format.js';
 
-window.__shotReady = false;
+const TICKER_IDLE_TEXT = 'Loading the latest entries…';
 
-let detailCss = null;
-function loadDetailCss() {
-  if (detailCss) return detailCss;
-  detailCss = new Promise((resolve) => {
-    const link = document.createElement("link");
-    link.rel = "stylesheet";
-    link.href = "detail.css";
-    link.onload = link.onerror = resolve;
-    document.head.append(link);
-  });
-  return detailCss;
+let renderSequence = 0;
+let visitController = null;
+let activeRouteName = 'board';
+let detailStylesPromise = null;
+
+const elements = {
+  view: document.getElementById('view'),
+  ticker: document.getElementById('ticker'),
+  tickerLine: document.getElementById('ticker-line'),
+  clock: document.getElementById('clock'),
+  searchForm: document.getElementById('search-form'),
+  searchInput: document.getElementById('search-input'),
+};
+
+function setShotReady(ready) {
+  window.__shotReady = Boolean(ready);
 }
 
-function parseHash() {
-  const raw = location.hash.replace(/^#/, "") || "/";
-  const [pathPart, queryPart] = raw.split("?");
-  const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
-  const query = new URLSearchParams(queryPart || "");
-  if (!parts.length) return { name: "board", params: {}, query };
-  if (parts[0] === "builders") return { name: "builders", params: {}, query };
-  if (parts[0] === "bounty" && parts[1]) {
-    if (parts[2] === "leaderboard") return { name: "leaderboard", params: { slug: parts[1] }, query };
-    return { name: "bounty", params: { slug: parts[1] }, query };
-  }
-  if (parts[0] === "u" && parts[1]) return { name: "profile", params: { handle: parts[1] }, query };
-  return { name: "notfound", params: {}, query };
-}
-
-function setNav(name) {
-  for (const a of document.querySelectorAll("[data-nav]")) {
-    if (a.dataset.nav === name) a.setAttribute("aria-current", "page");
-    else a.removeAttribute("aria-current");
+function safeDecode(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
   }
 }
 
-function setTitle(route) {
-  if (route.name === "bounty") document.title = "make.fun — Bounty";
-  else if (route.name === "leaderboard") document.title = "make.fun — Leaderboard";
-  else if (route.name === "profile") document.title = "make.fun — @" + route.params.handle;
-  else if (route.name === "builders") document.title = "make.fun — Top builders";
-  else document.title = "make.fun — live bounty board";
+function parseRoute(rawHash) {
+  const raw = (rawHash || '').replace(/^#/, '');
+  const queryIndex = raw.indexOf('?');
+  const pathPart = queryIndex === -1 ? raw : raw.slice(0, queryIndex);
+  const queryPart = queryIndex === -1 ? '' : raw.slice(queryIndex + 1);
+  const query = new URLSearchParams(queryPart);
+  const segments = pathPart.split('/').filter(Boolean).map(safeDecode);
+
+  if (segments.length === 0) {
+    return { name: 'board', query };
+  }
+  if (segments[0] === 'builders' && segments.length === 1) {
+    return { name: 'builders' };
+  }
+  if (segments[0] === 'bounty' && segments.length === 2) {
+    return { name: 'bounty', slug: segments[1] };
+  }
+  if (segments[0] === 'bounty' && segments.length === 3 && segments[2] === 'leaderboard') {
+    return { name: 'leaderboard', slug: segments[1] };
+  }
+  if (segments[0] === 'user' && segments.length === 2) {
+    return { name: 'profile', handle: segments[1] };
+  }
+  return { name: 'not-found', path: pathPart };
 }
 
-function showLoading(name) {
-  view.replaceChildren();
-  const div = document.createElement("div");
-  div.className = "loading";
-  div.textContent = name === "profile" ? "Loading profile…" : name === "leaderboard" ? "Loading leaderboard…" : "Loading…";
-  view.append(div);
+function routeTitle(route) {
+  switch (route.name) {
+    case 'bounty':
+      return 'make.fun Bounty';
+    case 'leaderboard':
+      return 'make.fun Leaderboard';
+    case 'profile':
+      return 'make.fun Profile';
+    case 'builders':
+      return 'make.fun Top Builders';
+    default:
+      return 'make.fun Bounty Board';
+  }
 }
 
-function showError(message) {
-  const div = document.createElement("div");
-  div.className = "err";
-  div.textContent = message;
-  const a = document.createElement("a");
-  a.href = "#/";
-  a.textContent = "Go to the board";
-  div.append(" ", a);
-  view.replaceChildren(div);
-}
-
-async function route() {
-  const token = ++routeToken;
-  const r = parseHash();
-  if (cleanup) {
-    try { cleanup(); } catch { /* ignore */ }
-    cleanup = null;
-  }
-  if (r.name !== "board") stopTicker();
-  setNav(r.name === "builders" ? "builders" : "board");
-  setTitle(r);
-
-  window.__shotReady = false;
-
-  if (r.name === "board") {
-    try {
-      cleanup = await renderBoard(view, { query: r.query });
-      if (token === routeToken) window.__shotReady = true;
-    } catch {
-      if (token === routeToken) {
-        showError("The board could not load. make.fun may be unreachable.");
-        window.__shotReady = true;
-      }
-    }
-    return;
-  }
-
-  if (r.name === "builders") {
-    try {
-      await loadDetailCss();
-      const mod = await import("./views/leaderboard.js");
-      if (token !== routeToken) return;
-      await mod.renderBuilders(view);
-    } catch {
-      if (token === routeToken) showError("Top builders could not load.");
-    }
-    if (token === routeToken) window.__shotReady = true;
-    return;
-  }
-
-  showLoading(r.name);
-
-  if (r.name === "bounty") {
-    try {
-      await loadDetailCss();
-      const mod = await import("./views/bounty.js");
-      if (token !== routeToken) return;
-      const result = await mod.render(view, { params: r.params, query: r.query });
-      if (typeof result === "function") cleanup = result;
-    } catch {
-      if (token === routeToken) {
-        view.querySelector(".err") || showError("The bounty could not load.");
-      }
-    }
-    if (token === routeToken) window.__shotReady = true;
-    return;
-  }
-
-  if (r.name === "leaderboard" || r.name === "profile") {
-    try {
-      await loadDetailCss();
-      const mod = r.name === "leaderboard"
-        ? await import("./views/leaderboard.js")
-        : await import("./views/profile.js");
-      if (token !== routeToken) return;
-      const result = await mod.render(view, { params: r.params, query: r.query });
-      if (typeof result === "function") cleanup = result;
-      if (r.name === "leaderboard" && typeof mod.teardown === "function") {
-        const prev = cleanup;
-        cleanup = () => { if (prev) prev(); mod.teardown(); };
-      }
-    } catch {
-      if (token === routeToken) {
-        view.querySelector(".err") || showError(r.name === "profile" ? "No profile @ " + r.params.handle + "." : "The leaderboard could not load.");
-      }
-    }
-    if (token === routeToken) window.__shotReady = true;
-    return;
-  }
-
-  const box = document.createElement("div");
-  box.className = "err";
-  box.textContent = "Page not found. ";
-  const a = document.createElement("a");
-  a.href = "#/";
-  a.textContent = "Back to the board";
-  box.append(a);
-  view.replaceChildren(box);
-  window.__shotReady = true;
-}
-
-function startClock() {
-  const node = document.getElementById("clock");
-  if (!node) return;
-  const tick = () => {
-    const d = new Date();
-    node.textContent = d.toLocaleTimeString("en-GB", { hour12: false, timeZone: "UTC" });
+function buildVisitContext(route, sequence) {
+  return {
+    route,
+    signal: visitController.signal,
+    ticker: { root: elements.ticker, line: elements.tickerLine },
+    isActive: () => sequence === renderSequence,
+    navigate: (hash) => {
+      if (location.hash === hash) renderRoute();
+      else location.hash = hash;
+    },
+    setTitle: (text) => {
+      document.title = text.startsWith('make.fun') ? text : `make.fun · ${text}`;
+    },
   };
-  tick();
-  setInterval(tick, 1000);
 }
 
-function wireSearch() {
-  const form = document.getElementById("search-form");
-  const input = document.getElementById("search-input");
-  if (!form || !input) return;
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const raw = input.value.trim();
-    if (!raw) return;
-    if (raw.startsWith("@")) {
-      location.hash = "#/u/" + encodeURIComponent(raw.slice(1));
-      return;
-    }
-    const current = parseHash();
-    if (current.name !== "board") {
-      location.hash = "#/?q=" + encodeURIComponent(raw);
-    } else {
-      setSearch(raw);
-    }
-  });
-  input.addEventListener("input", () => {
-    if (parseHash().name === "board") setSearch(input.value);
+function setActiveNavigation(name) {
+  document.querySelectorAll('[data-nav]').forEach((link) => {
+    const isCurrent = link.dataset.nav === name;
+    if (isCurrent) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
   });
 }
 
-function boot() {
-  startClock();
-  wireSearch();
-  window.addEventListener("hashchange", route);
-  if (!location.hash) location.hash = "#/";
-  route();
+function showRouteNotice(kind, message) {
+  const panel = document.createElement('section');
+  panel.className = `route-notice route-notice-${kind}`;
+  const heading = document.createElement('h1');
+  heading.textContent = kind === 'missing' ? 'That page does not exist' : 'Something went wrong';
+  const body = document.createElement('p');
+  body.textContent = message;
+  const action = document.createElement('a');
+  action.className = 'button button-primary';
+  action.href = '#/';
+  action.textContent = 'Back to the board';
+  panel.append(heading, body, action);
+  elements.view.replaceChildren(panel);
 }
 
-boot();
+// The detail surfaces share one stylesheet that the board and bounty routes
+// never need. Attach it once, on first use, and reuse the same promise.
+function ensureDetailStyles() {
+  if (detailStylesPromise) return detailStylesPromise;
+  detailStylesPromise = new Promise((resolve, reject) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'detail.css';
+    link.addEventListener('load', () => resolve());
+    link.addEventListener('error', () => reject(new Error('detail-styles')));
+    document.head.append(link);
+  }).catch(() => {});
+  return detailStylesPromise;
+}
+
+async function renderView(route, context) {
+  switch (route.name) {
+    case 'board': {
+      const module = await import('./views/board.js');
+      return module.renderBoard(elements.view, context);
+    }
+    case 'bounty': {
+      const module = await import('./views/bounty.js');
+      return module.renderBounty(elements.view, context);
+    }
+    case 'leaderboard': {
+      await ensureDetailStyles();
+      const module = await import('./views/leaderboard.js');
+      return module.renderLeaderboard(elements.view, context);
+    }
+    case 'profile': {
+      await ensureDetailStyles();
+      const module = await import('./views/profile.js');
+      return module.renderProfile(elements.view, context);
+    }
+    case 'builders': {
+      await ensureDetailStyles();
+      const module = await import('./views/leaderboard.js');
+      return module.renderBuilders(elements.view, context);
+    }
+    default:
+      showRouteNotice('missing', 'The address in the navigation bar does not match any PotScope route.');
+      return null;
+  }
+}
+
+async function renderRoute() {
+  const route = parseRoute(location.hash);
+  const sequence = ++renderSequence;
+  activeRouteName = route.name;
+
+  if (visitController) visitController.abort();
+  visitController = new AbortController();
+
+  setShotReady(false);
+  document.title = routeTitle(route);
+  setActiveNavigation(route.name === 'builders' ? 'builders' : 'board');
+
+  if (route.name === 'board') {
+    elements.ticker.hidden = false;
+    elements.tickerLine.textContent = TICKER_IDLE_TEXT;
+  } else {
+    elements.ticker.hidden = true;
+  }
+
+  const context = buildVisitContext(route, sequence);
+  try {
+    await renderView(route, context);
+  } catch (error) {
+    if (sequence === renderSequence) {
+      showRouteNotice('error', 'The data could not be loaded just now. Check the connection and try again.');
+    }
+  } finally {
+    if (sequence === renderSequence && route.name !== 'not-found') setShotReady(true);
+  }
+}
+
+function updateClock() {
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  elements.clock.textContent = `${hours}:${minutes}:${seconds}`;
+  elements.clock.dateTime = now.toISOString();
+  elements.clock.title = formatDateTime(now.toISOString());
+}
+
+function submitSearch(event) {
+  event.preventDefault();
+  const query = elements.searchInput.value.trim();
+  if (!query) return;
+  if (query.startsWith('@')) {
+    location.hash = `#/user/${encodeURIComponent(query.slice(1))}`;
+    return;
+  }
+  if (activeRouteName !== 'board') {
+    location.hash = '#/';
+    window.setTimeout(() => {
+      document.dispatchEvent(new CustomEvent('potscope:search', { detail: { query } }));
+    }, 0);
+    return;
+  }
+  document.dispatchEvent(new CustomEvent('potscope:search', { detail: { query } }));
+}
+
+function warmBoardCache() {
+  fetchBoard().catch(() => {});
+}
+
+function bootstrap() {
+  updateClock();
+  window.setInterval(updateClock, 1000);
+  elements.searchForm.addEventListener('submit', submitSearch);
+  window.addEventListener('hashchange', renderRoute);
+  window.PotScope = {
+    routes: ['#/', '#/bounty/:slug', '#/bounty/:slug/leaderboard', '#/user/:handle', '#/builders'],
+    current: () => activeRouteName,
+  };
+  warmBoardCache();
+  renderRoute();
+}
+
+bootstrap();

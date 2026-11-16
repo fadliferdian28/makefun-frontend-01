@@ -1,134 +1,197 @@
-const BASE = "https://make.fun/api";
+// Read-only client for the public make.fun API. Every response is cached in
+// memory with its ETag and fetch time; stale entries keep rendering while a
+// conditional request revalidates them in the background.
+
+export const API_ORIGIN = 'https://make.fun';
+export const API_BASE = `${API_ORIGIN}/api`;
+
+// Freshness windows, in milliseconds.
+export const LIST_FRESH_MS = 60_000;
+export const DETAIL_FRESH_MS = 300_000;
+
+const MAX_RETRY_AFTER_MS = 30_000;
+const DEFAULT_RETRY_AFTER_MS = 1_000;
+
+const responseCache = new Map();
+const inFlight = new Map();
 
 export class ApiError extends Error {
-  constructor(message, status, retryAfterMs) {
+  constructor(message, { status = 0, retryAfterMs = 0 } = {}) {
     super(message);
-    this.name = "ApiError";
-    this.status = status || 0;
-    this.retryAfterMs = retryAfterMs || 0;
+    this.name = 'ApiError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
-const cache = new Map();
-const inflight = new Map();
-
-function parseRetryAfter(value) {
-  if (!value) return 5000;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(1000, seconds * 1000);
-  const when = Date.parse(value);
-  if (Number.isFinite(when)) return Math.max(1000, when - Date.now());
-  return 5000;
+export function getCached(url) {
+  return responseCache.get(url) ?? null;
 }
 
-async function request(url, etag) {
-  const headers = { Accept: "application/json" };
-  if (etag) headers["If-None-Match"] = etag;
-  let res;
-  try {
-    res = await fetch(url, {
-      headers,
-      mode: "cors",
-      credentials: "omit",
-      cache: "no-store",
-      signal: AbortSignal.timeout(20000),
-    });
-  } catch (err) {
-    throw new ApiError("Network unavailable", 0);
-  }
-  if (res.status === 304) return { notModified: true, etag };
-  if (res.status === 503 || res.status === 429) {
-    throw new ApiError("Service busy", res.status, parseRetryAfter(res.headers.get("Retry-After")));
-  }
-  if (res.status === 404) throw new ApiError("Not found", 404);
-  if (!res.ok) throw new ApiError("Request failed (" + res.status + ")", res.status);
-  let body;
-  try {
-    body = await res.json();
-  } catch {
-    throw new ApiError("Bad response", res.status);
-  }
-  return { body, etag: res.headers.get("ETag") || "", finalUrl: res.url || url };
+export function cacheGet(url) {
+  return getCached(url);
 }
 
-// Fetch with If-None-Match; updates the cache in place on a 304.
-async function revalidate(url, ttlMs, etagHint) {
-  const hit = cache.get(url);
-  const etag = etagHint !== undefined ? etagHint : hit ? hit.etag : "";
-  let result = await request(url, etag);
-  if (result.notModified) {
-    if (hit) {
-      hit.at = Date.now();
-      cache.set(url, hit);
-      return { body: hit.body, stale: false, cached: true, notModified: true };
-    }
-    result = await request(url, "");
-  }
-  const entry = { body: result.body, etag: result.etag, at: Date.now(), finalUrl: result.finalUrl };
-  cache.set(url, entry);
-  return { body: result.body, stale: false, cached: false, finalUrl: result.finalUrl };
+export function cacheSet(url, data, etag, fetchedAt = Date.now()) {
+  responseCache.set(url, { data, etag: etag || null, fetchedAt });
 }
 
-function sleep(ms) {
+function isFresh(entry, ttl) {
+  return Boolean(entry) && Date.now() - entry.fetchedAt < ttl;
+}
+
+function retryAfterMs(response) {
+  const header = response.headers.get('retry-after');
+  if (!header) return DEFAULT_RETRY_AFTER_MS;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, seconds * 1000));
+  const date = Date.parse(header);
+  if (Number.isFinite(date)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, date - Date.now()));
+  return DEFAULT_RETRY_AFTER_MS;
+}
+
+function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Cache-first fetch with stale-while-revalidate: fresh cache is instant, stale
-// cache renders now and revalidates in the background, 503 retries Retry-After.
-export async function fetchCached(url, { ttl = 60000, onFresh = null, force = false } = {}) {
-  const hit = cache.get(url);
-  if (hit && !force) {
-    if (Date.now() - hit.at < ttl) {
-      return { body: hit.body, stale: false, cached: true };
-    }
-    const pending = inflight.get(url);
-    if (!pending) {
-      const job = revalidate(url, ttl)
-        .then((r) => {
-          if (onFresh) onFresh(r.body, false);
-          return r;
-        })
-        .catch(() => null)
-        .finally(() => inflight.delete(url));
-      inflight.set(url, job);
-    }
-    return { body: hit.body, stale: true, cached: true };
-  }
+// One GET with conditional headers. A 304 refreshes the stored timestamp; a
+// 503 honors retry-after and tries again; any other failure throws.
+async function requestJson(url, etag, attempt = 0) {
+  const headers = { accept: 'application/json' };
+  if (etag) headers['if-none-match'] = etag;
 
-  const pending = inflight.get(url);
-  if (pending) {
-    const r = await pending;
-    if (r) return r;
-  }
-
-  const job = (async () => {
-    let attempt = 0;
-    for (;;) {
-      try {
-        return await revalidate(url, ttl);
-      } catch (err) {
-        if (err instanceof ApiError && err.status === 503 && attempt < 2) {
-          attempt += 1;
-          await sleep(Math.min(err.retryAfterMs || 5000, 10000));
-          continue;
-        }
-        throw err;
-      }
-    }
-  })().finally(() => inflight.delete(url));
-  inflight.set(url, job);
-
+  let response;
   try {
-    return await job;
-  } catch (err) {
-    const stale = cache.get(url);
-    if (stale) {
-      return { body: stale.body, stale: true, cached: true, refreshFailed: true };
+    response = await fetch(url, { headers, credentials: 'omit', mode: 'cors' });
+  } catch {
+    throw new ApiError('network', { status: 0 });
+  }
+
+  if (response.status === 304) {
+    return { notModified: true, data: null, etag };
+  }
+  if (response.status === 404) {
+    throw new ApiError('not-found', { status: 404 });
+  }
+  if (response.status === 503 && attempt < 3) {
+    const delay = retryAfterMs(response);
+    if (delay <= MAX_RETRY_AFTER_MS) {
+      await wait(delay);
+      return requestJson(url, etag, attempt + 1);
     }
-    throw err;
+  }
+  if (!response.ok) {
+    throw new ApiError(`http-${response.status}`, { status: response.status });
+  }
+  return {
+    notModified: false,
+    data: await response.json(),
+    etag: response.headers.get('etag'),
+  };
+}
+
+// Revalidate a cached address without blocking the visible table. Resolves to
+// true when fresh data arrived and false when the old copy must stay.
+export async function revalidate(url) {
+  const entry = getCached(url);
+  if (!entry) return false;
+  if (inFlight.has(url)) return inFlight.get(url);
+  const task = (async () => {
+    try {
+      const result = await requestJson(url, entry.etag);
+      if (result.notModified) {
+        cacheSet(url, entry.data, entry.etag);
+      } else {
+        cacheSet(url, result.data, result.etag);
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      inFlight.delete(url);
+    }
+  })();
+  inFlight.set(url, task);
+  return task;
+}
+
+// The public entry point. Fresh cache answers at once; a stale cache answers
+// at once and refreshes behind the scene; an empty cache awaits the network.
+export async function fetchCached(url, { ttl = LIST_FRESH_MS, onRefresh } = {}) {
+  const entry = getCached(url);
+  if (isFresh(entry, ttl)) {
+    return { data: entry.data, stale: false, error: null, fetchedAt: entry.fetchedAt };
+  }
+  if (entry) {
+    revalidate(url).then((ok) => {
+      if (ok && typeof onRefresh === 'function') onRefresh(getCached(url));
+    });
+    return { data: entry.data, stale: true, error: null, fetchedAt: entry.fetchedAt };
+  }
+  if (inFlight.has(url)) {
+    const shared = await inFlight.get(url);
+    return { data: shared.data, stale: false, error: null, fetchedAt: Date.now() };
+  }
+  const task = (async () => {
+    const result = await requestJson(url, null);
+    cacheSet(url, result.data, result.etag);
+    return result;
+  })();
+  inFlight.set(url, task);
+  try {
+    const result = await task;
+    return { data: result.data, stale: false, error: null, fetchedAt: Date.now() };
+  } catch (error) {
+    return { data: null, stale: false, error: error instanceof ApiError ? error : new ApiError('network'), fetchedAt: 0 };
+  } finally {
+    inFlight.delete(url);
   }
 }
 
-export function getBoard(opts = {}) {
-  return fetchCached(BASE + "/competitions?activity=times", { ttl: 60000, ...opts });
+export function boardUrl() {
+  return `${API_BASE}/competitions?activity=times`;
+}
+
+export function bountyUrl(slug) {
+  return `${API_BASE}/competitions/${encodeURIComponent(slug)}?submissions=summary`;
+}
+
+export function liveUrl(slug) {
+  return `${API_BASE}/competitions/${encodeURIComponent(slug)}/live`;
+}
+
+export function leaderboardUrl(slug) {
+  return `${API_BASE}/competitions/${encodeURIComponent(slug)}/leaderboard?rows=first`;
+}
+
+export function profileUrl(handle) {
+  return `${API_BASE}/profiles/${encodeURIComponent(handle)}`;
+}
+
+export function rankingsUrl() {
+  return `${API_BASE}/rankings?order=wins&limit=10`;
+}
+
+export function fetchBoard(options) {
+  return fetchCached(boardUrl(), { ttl: LIST_FRESH_MS, ...options });
+}
+
+export function fetchBounty(slug, options) {
+  return fetchCached(bountyUrl(slug), { ttl: DETAIL_FRESH_MS, ...options });
+}
+
+export function fetchLive(slug, options) {
+  return fetchCached(liveUrl(slug), { ttl: LIST_FRESH_MS, ...options });
+}
+
+export function fetchLeaderboard(slug, options) {
+  return fetchCached(leaderboardUrl(slug), { ttl: LIST_FRESH_MS, ...options });
+}
+
+export function fetchProfile(handle, options) {
+  return fetchCached(profileUrl(handle), { ttl: DETAIL_FRESH_MS, ...options });
+}
+
+export function fetchRankings(options) {
+  return fetchCached(rankingsUrl(), { ttl: LIST_FRESH_MS, ...options });
 }
