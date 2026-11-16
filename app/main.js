@@ -1,7 +1,7 @@
 // main.js — hash router, bootstrap, live clock, search, __shotReady flag.
-// Static imports: board + bounty. Lazy: leaderboard + profile.
 
-import { render as renderBoard, renderBuilders, setSearch, primeTicker, startTicker, stopTicker } from "./views/board.js";
+import { render as renderBoard, setSearch, primeTicker, startTicker, stopTicker } from "./views/board.js";
+import { renderBuilders } from "./views/leaderboard.js";
 import { render as renderBounty } from "./views/bounty.js";
 
 const view = document.getElementById("view");
@@ -33,11 +33,11 @@ function setNav(name) {
 }
 
 function setTitle(route) {
-  if (route.name === "bounty") document.title = "Bounty · PotScope";
-  else if (route.name === "leaderboard") document.title = "Leaderboard · PotScope";
-  else if (route.name === "profile") document.title = "@" + route.params.handle + " · PotScope";
-  else if (route.name === "builders") document.title = "Top builders · PotScope";
-  else document.title = "PotScope — live make.fun bounty board";
+  if (route.name === "bounty") document.title = "make.fun — Bounty";
+  else if (route.name === "leaderboard") document.title = "make.fun — Leaderboard";
+  else if (route.name === "profile") document.title = "make.fun — @" + route.params.handle;
+  else if (route.name === "builders") document.title = "make.fun — Top builders";
+  else document.title = "make.fun — live bounty board";
 }
 
 function showLoading(name) {
