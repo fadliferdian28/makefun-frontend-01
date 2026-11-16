@@ -2,8 +2,9 @@
 // metric-adaptive score column + 90% interval, medals for the top 3) and the
 // top-builders surface (rank medals, win rate, entries, rewards).
 
-import { getLeaderboard, getTopBuilders } from "../api.js";
-import { num, score, intervalRange, money2, money, dateShort, pct, el, avatar, apiUrl } from "../format.js";
+import { getBounty, getLeaderboard, getTopBuilders } from "../api-detail.js";
+import { num, money2, el } from "../format.js";
+import { pct, score, intervalRange, money, dateShort, avatar, apiUrl } from "../format-detail.js";
 
 const PAGE_SIZE = 50;
 
@@ -230,7 +231,7 @@ export async function render(container, ctx = {}) {
   const view = ctx.query && ctx.query.get("view") || "";
 
   try {
-    const { body: b } = await (await import("../api.js")).getBounty(slug);
+    const { body: b } = await getBounty(slug);
     const { body: data } = await getLeaderboard(slug, { phase, view });
     const phaseInfo = data.phase || {};
     const title = b.title || slug;
@@ -326,9 +327,7 @@ function builderRank(rank) {
 
 function winRate(rec) {
   const entered = Number(rec.competitions_entered) || 0;
-  const won = Number(rec.competitions_won) || 0;
-  if (!entered) return "—";
-  return pct((won / entered) * 100, 1);
+  return entered ? pct((Number(rec.competitions_won) || 0) / entered * 100, 1) : "—";
 }
 
 export async function renderBuilders(container) {
@@ -341,22 +340,6 @@ export async function renderBuilders(container) {
       el("h1", null, "Leaderboard"),
       el("div", { class: "muted", style: "font-size:13px;width:100%" }, "Top builders on make.fun"),
     );
-
-    // The rankings API has no time dimension: the pills are visual only and
-    // "All Time" stays selected. No data is invented.
-    const filters = el("div", { class: "toggle", role: "group", "aria-label": "Time range" });
-    for (const label of ["All Time", "This Month", "This Week"]) {
-      filters.append(el("button", {
-        type: "button",
-        "aria-pressed": label === "All Time" ? "true" : "false",
-        title: label === "All Time" ? "" : "Time filtering is unavailable from the API",
-      }, label));
-    }
-    filters.addEventListener("click", (e) => {
-      const btn = e.target.closest("button");
-      if (!btn) return;
-      for (const b2 of filters.children) b2.setAttribute("aria-pressed", String(b2 === btn));
-    });
 
     const tbody = el("tbody");
     for (const row of items) {
@@ -393,7 +376,6 @@ export async function renderBuilders(container) {
 
     const frag = el("div", null,
       head,
-      el("div", { class: "lb-tools" }, filters),
       items.length ? el("div", { class: "tablewrap" }, table) : el("div", { class: "empty" }, "No builders ranked yet."),
     );
     container.replaceChildren(frag);

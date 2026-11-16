@@ -1,9 +1,10 @@
 // profile.js — lazy-loaded public profile: card layout with avatar/handle,
-// three stat boxes, recent activity built from real solutions/payouts,
+// five stat boxes, recent activity built from real solutions/payouts,
 // entries table, payouts panel and a motivational strip.
 
-import { getProfile } from "../api.js";
-import { num, money2, pct, dateShort, profileScore, el, avatar, apiUrl, placeLabel } from "../format.js";
+import { getProfile } from "../api-detail.js";
+import { num, money2, el } from "../format.js";
+import { dateShort, profileScore, avatar, apiUrl, placeLabel } from "../format-detail.js";
 
 function svg(paths) {
   const ns = "http://www.w3.org/2000/svg";
@@ -174,10 +175,7 @@ export async function render(container, ctx = {}) {
     const imgSrc = apiUrl((p.avatar && (p.avatar.url_small || p.avatar.url)) || p.image);
     const name = p.display_name || p.handle || handle;
 
-    const entered = Number(rec.competitions_entered) || 0;
-    const won = Number(rec.competitions_won) || 0;
-    const placed = Number(rec.competitions_placed) || 0;
-    const hasRate = entered > 0 && rec.competitions_placed !== undefined && rec.competitions_placed !== null;
+    const dash = (v) => (v === undefined || v === null ? "—" : num(v));
 
     const rank = p.rank || p.ranking || null;
     const points = (rank && (rank.points ?? rank.score)) ?? p.points ?? null;
@@ -200,9 +198,11 @@ export async function render(container, ctx = {}) {
         el("a", { class: "btn", href: "https://make.fun/u/" + encodeURIComponent(p.handle || handle), rel: "noopener" }, "View on make.fun"),
       ),
       el("div", { class: "p-stats" },
-        statBox("Entries", num(rec.competitions_entered)),
-        hasRate ? statBox("Win Rate", pct((won / entered) * 100, 1)) : null,
-        statBox("Total Rewards", money2(rec.prize_usd || 0), "money"),
+        statBox("Entries", dash(rec.competitions_entered)),
+        statBox("Placed", dash(rec.competitions_placed)),
+        statBox("Won", dash(rec.competitions_won)),
+        statBox("Best Place", rec.best_placement === undefined || rec.best_placement === null ? "—" : placeLabel(rec.best_placement)),
+        statBox("Total Rewards", rec.prize_usd === undefined || rec.prize_usd === null ? "—" : money2(rec.prize_usd), "money"),
       ),
     );
 

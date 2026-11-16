@@ -1,8 +1,5 @@
-// board.js — bounty board: compact hero, 4 stat cards, filters, dense table.
-// One fetch (competitions?activity=times). Filtering, sorting and splitting are client-side.
-
-import { getBoard, getTopBuilders, ApiError } from "../api.js";
-import { money, money2, moneyShort, num, timeLeft, timeAgo, esc, el } from "../format.js";
+import { getBoard, ApiError } from "../api.js";
+import { money2, moneyShort, num, timeLeft, timeAgo, esc, el } from "../format.js";
 
 const TAKING = "taking";
 const CLOSED = "closed";
@@ -18,7 +15,7 @@ let tickerIndex = 0;
 let knownCounts = new Map();
 let tickerPrime = false;
 
-export function classify(item, now = Date.now()) {
+function classify(item, now = Date.now()) {
   const published = Date.parse(item.publishedAt || item.opensAt || 0);
   const deadline = Date.parse(item.deadline || 0);
   if (Number.isFinite(published) && published > now) return OPENING;
@@ -26,13 +23,13 @@ export function classify(item, now = Date.now()) {
   return TAKING;
 }
 
-export function paidPlaces(item) {
+function paidPlaces(item) {
   if (Array.isArray(item.rewardsNow) && item.rewardsNow.length) return item.rewardsNow.length;
   if (item.rewards && typeof item.rewards === "object") return Object.keys(item.rewards).length;
   return 20;
 }
 
-export function valuePerEntry(item) {
+function valuePerEntry(item) {
   const pot = Number(item.potUsd) || 0;
   const places = paidPlaces(item);
   const entries = Number(item.submissionCount) || 0;
@@ -55,8 +52,6 @@ function progress(item, now) {
   if (!Number.isFinite(span) || span <= 0) return 100;
   return Math.max(0, Math.min(100, ((now - start) / span) * 100));
 }
-
-// ---- ticker --------------------------------------------------------------
 
 function entryHandle(sub) {
   return sub.hunter || sub.handle || sub.author || sub.agent || "";
@@ -145,8 +140,6 @@ export function stopTicker() {
   if (tickerTimer) clearInterval(tickerTimer);
   tickerTimer = null;
 }
-
-// ---- rendering -----------------------------------------------------------
 
 function boardStats(items) {
   const now = Date.now();
@@ -270,7 +263,6 @@ function timeCell(item, now) {
 function row(item, now) {
   const slug = item.slug;
   const pot = Number(item.potUsd) || 0;
-  const fee = item.entryFeeUsd === null || item.entryFeeUsd === undefined ? 0 : Number(item.entryFeeUsd);
   const val = valuePerEntry(item);
   const paidRow = isPaid(item);
   const tr = el("tr", null,
@@ -368,8 +360,6 @@ export function setSearch(q) {
   renderTable();
 }
 
-// ---- entry points --------------------------------------------------------
-
 export async function render(container, ctx = {}) {
   container.replaceChildren(el("div", { class: "loading" }, "Loading the board…"));
   try {
@@ -395,31 +385,5 @@ export async function render(container, ctx = {}) {
     container.replaceChildren(el("div", { class: "err" }, msg + " ",
       el("button", { class: "pill", type: "button", onclick: () => render(container, ctx) }, "Retry")));
     throw err;
-  }
-}
-
-/** Optional Top builders surface linked from the header. */
-export async function renderBuilders(container) {
-  container.replaceChildren(el("div", { class: "loading" }, "Loading top builders…"));
-  try {
-    const { body } = await getTopBuilders();
-    const items = Array.isArray(body.items) ? body.items : [];
-    const head = el("div", { class: "sechead" }, el("h1", null, "Top builders"), el("span", { class: "n" }, "by wins"));
-    const list = el("div", { class: "builders" });
-    for (const row of items) {
-      const rec = row.record || {};
-      list.append(el("div", { class: "brow" },
-        el("span", { class: "r" }, "#" + num(row.rank)),
-        el("div", { class: "g" },
-          el("a", { class: "n", href: "#/u/" + encodeURIComponent(row.handle) }, row.display_name || row.handle),
-          el("div", { class: "m" }, "@" + (row.handle || "") + " · " + num(rec.competitions_won) + " wins · " + num(rec.competitions_entered) + " entered · " + money(rec.prize_usd) + " prizes"),
-        ),
-      ));
-    }
-    if (!items.length) list.append(el("div", { class: "empty" }, "No builders ranked yet."));
-    container.replaceChildren(head, list);
-  } catch {
-    container.replaceChildren(el("div", { class: "err" }, "Could not load top builders."));
-    throw new Error("builders failed");
   }
 }

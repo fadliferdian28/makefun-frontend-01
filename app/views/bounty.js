@@ -1,10 +1,11 @@
 // bounty.js — bounty detail: emerald hero header, live stat strip, in-page
 // tabs (Overview/Leaderboard/Rules/Rewards/Activity) and a rewards sidebar.
 
-import { getBounty, getLive } from "../api.js";
+import { getBounty, getLive } from "../api-detail.js";
+import { num, money2, esc, el } from "../format.js";
 import {
-  money2, num, countdown, dateTimeShort, esc, el, apiUrl, placeLabel, markdownToHtml,
-} from "../format.js";
+  countdown, dateTimeShort, apiUrl, placeLabel, markdownToHtml,
+} from "../format-detail.js";
 
 let countdownTimer = null;
 
