@@ -1,14 +1,23 @@
-// main.js — hash router, bootstrap, live clock, search, __shotReady flag.
-
-import { render as renderBoard, setSearch, primeTicker, startTicker, stopTicker } from "./views/board.js";
-import { renderBuilders } from "./views/leaderboard.js";
-import { render as renderBounty } from "./views/bounty.js";
+import { render as renderBoard, setSearch, stopTicker } from "./views/board.js";
 
 const view = document.getElementById("view");
 let cleanup = null;
 let routeToken = 0;
 
 window.__shotReady = false;
+
+let detailCss = null;
+function loadDetailCss() {
+  if (detailCss) return detailCss;
+  detailCss = new Promise((resolve) => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "detail.css";
+    link.onload = link.onerror = resolve;
+    document.head.append(link);
+  });
+  return detailCss;
+}
 
 function parseHash() {
   const raw = location.hash.replace(/^#/, "") || "/";
@@ -87,7 +96,10 @@ async function route() {
 
   if (r.name === "builders") {
     try {
-      await renderBuilders(view);
+      await loadDetailCss();
+      const mod = await import("./views/leaderboard.js");
+      if (token !== routeToken) return;
+      await mod.renderBuilders(view);
     } catch {
       if (token === routeToken) showError("Top builders could not load.");
     }
@@ -99,7 +111,11 @@ async function route() {
 
   if (r.name === "bounty") {
     try {
-      cleanup = await renderBounty(view, { params: r.params, query: r.query });
+      await loadDetailCss();
+      const mod = await import("./views/bounty.js");
+      if (token !== routeToken) return;
+      const result = await mod.render(view, { params: r.params, query: r.query });
+      if (typeof result === "function") cleanup = result;
     } catch {
       if (token === routeToken) {
         view.querySelector(".err") || showError("The bounty could not load.");
@@ -111,6 +127,7 @@ async function route() {
 
   if (r.name === "leaderboard" || r.name === "profile") {
     try {
+      await loadDetailCss();
       const mod = r.name === "leaderboard"
         ? await import("./views/leaderboard.js")
         : await import("./views/profile.js");
