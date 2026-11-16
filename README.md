@@ -26,8 +26,9 @@ node serve.ts --port 9000
 
 ## Performance
 
-- First load: `index.html` + one small CSS file + one small JS module (board and bounty
-  views statically imported); leaderboard and profile views load on demand via `import()`.
+- First load: `index.html` + `style.css` + `main.js` + `api.js` + `format.js` +
+  `views/board.js` (~11.9 KB gzipped total). Bounty, leaderboard and profile views load on
+  demand via `import()` together with `detail.css`, `api-detail.js` and `format-detail.js`.
 - One API request per view: board (`?activity=times`), bounty (`?submissions=summary`),
   leaderboard (`?rows=first`), profile. The bounty page adds one `/live` call for the top-5 strip.
 - In-memory cache keyed by URL with ETag revalidation: fresh for 60s (lists) / 5min
