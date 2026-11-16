@@ -1,389 +1,218 @@
-import { getBoard, ApiError } from "../api.js";
-import { money2, moneyShort, num, timeLeft, timeAgo, esc, el } from "../format.js";
+// Bounty board: compact hero, live stat cards, summary strip, one-line entry
+// ticker, client-side filters, and live, opening-soon, and closed sections.
 
-const TAKING = "taking";
-const CLOSED = "closed";
-const OPENING = "opening";
+import { fetchBoard } from '../api.js';
+import { formatMoney, formatNumber, formatRelativeTime, formatTimeLeft } from '../format.js';
+import { asList, escapeHtml, handleOf, parseTimestamp, readCompetition, toIso } from './common.js';
 
-let boardItems = [];
-let filterState = { status: "all", fee: "any", sort: "closing", category: "all", q: "" };
-let tableRoot = null;
-let tickerTimer = null;
-let tickerRotate = null;
-let tickerEvents = [];
-let tickerIndex = 0;
-let knownCounts = new Map();
-let tickerPrime = false;
+const DAY = 86_400_000;
+const POLL_MS = 60_000;
+const ROTATE_MS = 5_000;
 
-function classify(item, now = Date.now()) {
-  const published = Date.parse(item.publishedAt || item.opensAt || 0);
-  const deadline = Date.parse(item.deadline || 0);
-  if (Number.isFinite(published) && published > now) return OPENING;
-  if (Number.isFinite(deadline) && deadline <= now) return CLOSED;
-  return TAKING;
+const ICONS = {
+  trophy: '<path d="M8 4h8v3a4 4 0 0 1-8 0V4Z" fill="currentColor"/><path d="M6 5H3.5v1.5A3.5 3.5 0 0 0 7 10M18 5h2.5v1.5A3.5 3.5 0 0 1 17 10M10 13h4v3h-4zM8 20h8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+  coins: '<circle cx="9" cy="9" r="5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12.5 6.6A5 5 0 1 1 9 17" fill="none" stroke="currentColor" stroke-width="1.8"/>',
+  entries: '<circle cx="9" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+  clock: '<circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7.5V12l3 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+};
+const TROPHY = '<path d="M30 16h12v5a6 6 0 0 1-12 0v-5Z" fill="#0f9d63"/><path d="M26 17h-5v4a6 6 0 0 0 6 6M46 17h5v4a6 6 0 0 1-6 6" fill="none" stroke="#d9a514" stroke-width="3" stroke-linecap="round"/><path d="M33 27h6v7h-6z" fill="#d9a514"/><path d="M27 40h18M31 36h10v4H31z" fill="none" stroke="#0a6b45" stroke-width="3" stroke-linecap="round"/><path d="M36 9l1.6 3.4L41 14l-3.4 1.6L36 19l-1.6-3.4L31 14l3.4-1.6L36 9Z" fill="#d9a514"/>';
+const icon = (name) => `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">${ICONS[name]}</svg>`;
+
+const isLive = (item, now) => item.deadline !== null && item.deadline > now && (item.publish === null || item.publish <= now);
+const isSoon = (item) => item.publish !== null && item.publish > Date.now();
+const isClosingSoon = (item, now) => item.deadline !== null && item.deadline > now && item.deadline - now <= DAY;
+const isClosed = (item, now) => item.deadline !== null && item.deadline <= now;
+const placesOf = (item) => item.rewards.length;
+const valuePerEntry = (item) => (item.pot === null || !item.entries || !item.rewards.length ? null : item.pot / item.rewards.length / item.entries);
+const sumPot = (items) => items.reduce((total, item) => total + (item.pot ?? 0), 0);
+const sumEntries = (items) => items.reduce((total, item) => total + (item.entries ?? 0), 0);
+
+const statCard = (name, label, value, note) => `<div class="stat-card"><div class="stat-icon">${icon(name)}</div>
+  <div class="stat-body"><span class="stat-label">${label}</span><span class="stat-value">${value}</span><span class="stat-note">${note}</span></div></div>`;
+
+const heroMarkup = () => `<section class="hero"><div class="hero-copy">
+  <h1>Discover and Compete on <span>make.fun</span> Bounties</h1>
+  <p>Build amazing AI agents, win rewards, and climb the leaderboard</p></div>
+  <div class="hero-art" aria-hidden="true"><svg viewBox="0 0 72 72" width="72" height="72" focusable="false">${TROPHY}</svg></div></section>`;
+
+function statMarkup(items, now) {
+  return statCard('trophy', 'Total bounties', formatNumber(items.length), 'Every listing')
+    + statCard('coins', 'Total rewards', formatMoney(sumPot(items)), 'Live pots, in dollars')
+    + statCard('entries', 'Total entries', formatNumber(sumEntries(items)), 'Submissions received')
+    + statCard('clock', 'Closing soon', formatNumber(items.filter((item) => isClosingSoon(item, now)).length), 'Within 24 hours');
 }
 
-function paidPlaces(item) {
-  if (Array.isArray(item.rewardsNow) && item.rewardsNow.length) return item.rewardsNow.length;
-  if (item.rewards && typeof item.rewards === "object") return Object.keys(item.rewards).length;
-  return 20;
+function summaryMarkup(items, now) {
+  const live = items.filter((item) => isLive(item, now));
+  const piece = (value, label) => `<span><b>${value}</b> ${label}</span>`;
+  return piece(formatNumber(live.length), 'taking entries')
+    + piece(formatMoney(sumPot(live)), 'in live pots')
+    + piece(formatNumber(sumEntries(live)), 'entries so far')
+    + piece(formatNumber(items.filter((item) => isClosingSoon(item, now)).length), 'close in 24 hours');
 }
 
-function valuePerEntry(item) {
-  const pot = Number(item.potUsd) || 0;
-  const places = paidPlaces(item);
-  const entries = Number(item.submissionCount) || 0;
-  if (!entries || !places) return 0;
-  return pot / places / entries;
+function filterMarkup(state, items, now) {
+  const pill = (group, value, label, count) => `<button type="button" class="pill" data-filter="${group}" data-value="${escapeHtml(value)}" aria-pressed="${state[group] === value}">${escapeHtml(label)}${count === undefined ? '' : `<span class="count">${formatNumber(count)}</span>`}</button>`;
+  const statuses = [['all', 'All', items.length], ['live', 'Taking entries', items.filter((item) => isLive(item, now)).length], ['soon', 'Closing soon', items.filter((item) => isClosingSoon(item, now)).length], ['closed', 'Closed', items.filter((item) => isClosed(item, now)).length]];
+  const categories = [...new Set(items.map((item) => item.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const categoryRow = categories.length ? `<div class="filter-row"><span class="filter-row-label">Category</span>${pill('category', 'all', 'All')}${categories.map((name) => pill('category', name, name)).join('')}</div>` : '';
+  return `<div class="filter-row"><span class="filter-row-label">Status</span>${statuses.map(([value, label, count]) => pill('status', value, label, count)).join('')}<span class="result-count">${formatNumber(items.length)} bounties</span></div>
+    <div class="filter-row"><span class="filter-row-label">Fee</span>${pill('fee', 'any', 'Any')}${pill('fee', 'free', 'Free')}${pill('fee', 'paid', 'Paid')}
+    <select class="filter-select" data-sort aria-label="Sort bounties">${[['closing', 'Closing soonest'], ['pot', 'Biggest pot'], ['entries', 'Most entries'], ['value', 'Best value per entry']].map(([value, label]) => `<option value="${value}"${state.sort === value ? ' selected' : ''}>${label}</option>`).join('')}</select></div>${categoryRow}`;
 }
 
-function isPaid(item) {
-  return item.entryFeeUsd !== null && item.entryFeeUsd !== undefined && Number(item.entryFeeUsd) > 0;
+function matches(item, state, now) {
+  if (state.category !== 'all' && item.category !== state.category) return false;
+  if (state.fee === 'free' && item.fee !== null && item.fee > 0) return false;
+  if (state.fee === 'paid' && (item.fee === null || item.fee <= 0)) return false;
+  if (state.status === 'live' && !isLive(item, now)) return false;
+  if (state.status === 'soon' && !isClosingSoon(item, now)) return false;
+  if (state.status === 'closed' && !isClosed(item, now)) return false;
+  return !state.query || [item.title, item.slug, item.category, ...item.skills].join(' ').toLowerCase().includes(state.query);
 }
 
-function entryWindow(item) {
-  const start = Date.parse(item.publishedAt || item.opensAt || 0);
-  const end = Date.parse(item.deadline || 0);
-  return { start, end, span: end - start };
+function compare(left, right, sort) {
+  if (sort === 'pot') return (right.pot ?? -1) - (left.pot ?? -1);
+  if (sort === 'entries') return (right.entries ?? -1) - (left.entries ?? -1);
+  if (sort === 'value') return (valuePerEntry(right) ?? -1) - (valuePerEntry(left) ?? -1);
+  return (left.deadline ?? Infinity) - (right.deadline ?? Infinity);
 }
 
-function progress(item, now) {
-  const { start, end, span } = entryWindow(item);
-  if (!Number.isFinite(span) || span <= 0) return 100;
-  return Math.max(0, Math.min(100, ((now - start) / span) * 100));
+function rowMarkup(item, now) {
+  const elapsed = item.publish !== null && item.deadline !== null && item.deadline > item.publish ? Math.min(100, Math.max(0, ((now - item.publish) / (item.deadline - item.publish)) * 100)) : 0;
+  const bar = elapsed > 0 ? `<span class="time-bar" aria-hidden="true"><span style="width:${elapsed.toFixed(1)}%"></span></span>` : '';
+  return `<tr${item.fee !== null && item.fee > 0 ? ' class="row-paid"' : ''}>
+    <td class="bounty-cell"><a class="bounty-title" href="#/bounty/${encodeURIComponent(item.slug)}">${escapeHtml(item.title)}</a>
+    <span class="meta-line">${item.category ? `<span class="category-pill">${escapeHtml(item.category)}</span>` : ''}${item.skills.slice(0, 3).map((skill) => `<span class="skill-tag">${escapeHtml(skill)}</span>`).join('')}</span></td>
+    <td class="num"><span class="pot">${formatMoney(item.pot)}</span></td>
+    <td>${item.fee !== null && item.fee > 0 ? `<span class="fee-paid">${formatMoney(item.fee)}</span>` : '<span class="fee-free">FREE</span>'}</td>
+    <td><span class="time-left${item.deadline !== null && item.deadline <= now ? ' closed' : ''}">${escapeHtml(formatTimeLeft(toIso(item.deadline), now))}</span>${bar}</td>
+    <td class="num">${formatNumber(item.entries)}</td>
+    <td class="num"><span class="value-entry" title="Live pot divided by paid places, then divided by entries">${formatMoney(valuePerEntry(item))}${placesOf(item) ? `<small>${formatNumber(placesOf(item))} places</small>` : ''}</span></td></tr>`;
 }
 
-function entryHandle(sub) {
-  return sub.hunter || sub.handle || sub.author || sub.agent || "";
+function sectionMarkup(label, note, items, now, state) {
+  const rows = items.slice().sort((left, right) => compare(left, right, state.sort)).map((item) => rowMarkup(item, now)).join('');
+  return `<div class="section-label">${label}</div><div class="section-head"><p>${note}</p></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Bounty</th><th class="num">Live pot</th><th>Fee</th><th>Time left</th><th class="num">Entries</th><th class="num">Value / entry</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="empty-cell">No bounties here match the filters.</td></tr>'}</tbody></table></div>`;
 }
 
-function recentEntries(items, limit = 6) {
-  const out = [];
-  for (const item of items) {
-    const subs = Array.isArray(item.submissions) ? item.submissions : [];
-    for (const sub of subs) {
-      const at = sub.createdAt || sub.created_at;
-      if (!at) continue;
-      out.push({ at, handle: entryHandle(sub), title: item.title, slug: item.slug });
-    }
+function sectionsMarkup(items, state, now) {
+  const visible = items.filter((item) => matches(item, state, now));
+  const live = visible.filter((item) => isLive(item, now));
+  const soon = visible.filter((item) => isSoon(item));
+  const closed = visible.filter((item) => isClosed(item, now));
+  if (!live.length && !soon.length && !closed.length) return '<div class="empty-state"><h2>No bounties match these filters</h2><p>Clear a status, fee, or category pill to see the whole board.</p></div>';
+  let markup = sectionMarkup('Live bounties', 'Taking entries right now.', live, now, state);
+  if (soon.length) markup += sectionMarkup('Opening soon', 'Scheduled bounties whose publish date is still ahead.', soon, now, state);
+  if (closed.length) markup += sectionMarkup('Closed / awaiting results', 'The deadline has passed; results may still be pending.', closed, now, state);
+  return markup;
+}
+
+function initialEvents(payload) {
+  const found = [];
+  for (const row of asList(payload?.activity ?? payload?.recent_entries)) {
+    const time = parseTimestamp(row?.created_at ?? row?.entered_at ?? row?.date);
+    if (time !== null) found.push({ handle: handleOf(row), title: String(row?.competition_title ?? row?.title ?? 'a bounty'), time });
   }
-  out.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
-  return out.slice(0, limit);
+  return found.sort((left, right) => right.time - left.time).slice(0, 5);
 }
 
-function tickerMarkup(events, now) {
-  if (!events.length) return "Watching make.fun for new entries…";
-  return events.map((e) => {
-    const who = e.handle ? '<b>@' + esc(e.handle) + '</b> entered ' : 'New entry in ';
-    return who + '<b>' + esc(e.title || e.slug) + '</b> · ' + timeAgo(e.at, now);
-  }).join('<span class="ticker-sep">·</span>');
-}
+export async function renderBoard(root, context) {
+  context.setTitle('Bounty Board');
+  const state = { status: 'all', fee: 'any', category: 'all', sort: 'closing', query: '' };
+  let items = [];
+  let events = [];
+  let tick = 0;
+  let previous = new Map();
+  let noticeText = '';
 
-function paintTicker() {
-  const node = document.getElementById("ticker-text");
-  if (!node) return;
-  if (!tickerEvents.length) { node.textContent = "Watching make.fun for new entries…"; return; }
-  const now = Date.now();
-  const one = tickerEvents[tickerIndex % tickerEvents.length];
-  node.innerHTML = tickerMarkup([one], now);
-}
+  root.innerHTML = `${heroMarkup()}<div class="stat-row" data-stats></div><div class="summary-strip" data-summary></div>
+    <div data-notice></div><div class="filters" data-filters></div><div data-sections></div>`;
+  const stats = root.querySelector('[data-stats]');
+  const summary = root.querySelector('[data-summary]');
+  const notice = root.querySelector('[data-notice]');
+  const filters = root.querySelector('[data-filters]');
+  const sections = root.querySelector('[data-sections]');
 
-function setTickerEvents(events) {
-  tickerEvents = events;
-  tickerIndex = 0;
-  paintTicker();
-}
-
-export function primeTicker(items) {
-  if (tickerPrime) return;
-  tickerPrime = true;
-  for (const it of items) knownCounts.set(it.slug, Number(it.submissionCount) || 0);
-  setTickerEvents(recentEntries(items));
-  if (tickerRotate) clearInterval(tickerRotate);
-  tickerRotate = setInterval(() => {
-    if (tickerEvents.length > 1) {
-      tickerIndex = (tickerIndex + 1) % tickerEvents.length;
-      paintTicker();
+  function paintTicker() {
+    const line = context.ticker?.line;
+    if (!line) return;
+    if (events.length) {
+      const event = events[tick % events.length];
+      const who = event.handle ? `<strong>@${escapeHtml(event.handle)}</strong> entered ` : 'New entry on ';
+      line.innerHTML = `${who}<strong>${escapeHtml(event.title)}</strong> <span class="muted">${escapeHtml(formatRelativeTime(toIso(event.time), Date.now()))}</span>`;
+      return;
     }
-  }, 6000);
-}
-
-export function startTicker() {
-  if (tickerTimer) return;
-  tickerTimer = setInterval(async () => {
-    try {
-      const { body } = await getBoard({ force: true });
-      const items = Array.isArray(body.items) ? body.items : [];
-      const fresh = [];
-      for (const it of items) {
-        const prev = knownCounts.get(it.slug);
-        const count = Number(it.submissionCount) || 0;
-        if (prev !== undefined && count > prev) {
-          const subs = (it.submissions || []).filter((s) => Date.parse(s.createdAt || s.created_at) > Date.now() - 120000);
-          if (subs.length) {
-            for (const s of subs) fresh.push({ at: s.createdAt || s.created_at, handle: entryHandle(s), title: it.title, slug: it.slug });
-          } else {
-            fresh.push({ at: new Date().toISOString(), handle: "", title: it.title + " (" + (count - prev) + " new)", slug: it.slug });
-          }
-        }
-        knownCounts.set(it.slug, count);
-      }
-      if (fresh.length) setTickerEvents(fresh.concat(tickerEvents).slice(0, 8));
-      else if (!tickerEvents.length) setTickerEvents(recentEntries(items));
-      else paintTicker();
-      if (boardItems.length && items.length) { boardItems = items; renderTable(); }
-    } catch { /* keep last ticker line */ }
-  }, 60000);
-}
-
-export function stopTicker() {
-  if (tickerTimer) clearInterval(tickerTimer);
-  tickerTimer = null;
-}
-
-function boardStats(items) {
-  const now = Date.now();
-  const taking = items.filter((i) => classify(i, now) === TAKING);
-  const totalBounties = items.length;
-  const totalRewards = taking.reduce((s, i) => s + (Number(i.potUsd) || 0), 0);
-  const totalEntries = taking.reduce((s, i) => s + (Number(i.submissionCount) || 0), 0);
-  const closingSoon = taking.filter((i) => {
-    const dl = Date.parse(i.deadline);
-    return Number.isFinite(dl) && (dl - now) <= 86400000 && (dl - now) >= 0;
-  }).length;
-  return { totalBounties, totalRewards, totalEntries, closingSoon };
-}
-
-function boardHero() {
-  const wrap = el("section", { class: "board-hero" });
-  const left = el("div", null,
-    el("h1", { class: "board-hero-title" }, "Discover & Compete on ", el("span", { class: "em" }, "make.fun"), " Bounties"),
-    el("p", { class: "board-hero-sub" }, "Build amazing AI agents, win rewards, and climb the leaderboard."),
-  );
-  const right = el("div", { class: "board-hero-art", "aria-hidden": "true" });
-  right.innerHTML = '<svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v6a5 5 0 0 1-10 0V4z"/><path d="M5 4H3v2a4 4 0 0 0 4 4"/><path d="M19 4h2v2a4 4 0 0 1-4 4"/></svg>';
-  wrap.append(left, right);
-  return wrap;
-}
-
-function statCard(label, value, iconSvg) {
-  const icon = el("div", { class: "stat-ico" });
-  icon.innerHTML = iconSvg;
-  return el("div", { class: "stat-card" },
-    el("div", { class: "stat-top" }, icon, el("div", { class: "stat-label" }, label)),
-    el("div", { class: "stat-value" }, value),
-  );
-}
-
-function summaryStrip(items) {
-  const stats = boardStats(items);
-  const row = el("div", { class: "stat-row" });
-  row.append(
-    statCard("Total Bounties", num(stats.totalBounties),
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v6a5 5 0 0 1-10 0V4z"/><path d="M5 4H3v2a4 4 0 0 0 4 4"/><path d="M19 4h2v2a4 4 0 0 1-4 4"/></svg>'),
-    statCard("Total Rewards", moneyShort(stats.totalRewards),
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>'),
-    statCard("Total Entries", num(stats.totalEntries),
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>'),
-    statCard("Closing Soon", num(stats.closingSoon),
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'),
-  );
-  return row;
-}
-
-function statusCounts(items) {
-  const now = Date.now();
-  const c = { all: items.length, taking: 0, closing: 0, closed: 0, opening: 0 };
-  for (const it of items) {
-    const k = classify(it, now);
-    c[k] += 1;
-    if (k === TAKING && Date.parse(it.deadline) - now <= 86400000) c.closing += 1;
+    const next = items.filter((item) => isLive(item, Date.now())).sort((a, b) => (a.deadline ?? Infinity) - (b.deadline ?? Infinity))[0];
+    const tail = next ? ` · next close <strong>${escapeHtml(next.title)}</strong> in <strong>${escapeHtml(formatTimeLeft(toIso(next.deadline), Date.now()))}</strong>` : '';
+    line.innerHTML = `Watching <strong>${formatNumber(items.length)}</strong> bounties · <strong>${formatNumber(sumEntries(items))}</strong> entries received${tail}`;
   }
-  return c;
-}
 
-function categoryCounts(items) {
-  const map = new Map();
-  for (const it of items) {
-    const c = it.category || "Other";
-    map.set(c, (map.get(c) || 0) + 1);
+  function paint() {
+    const now = Date.now();
+    stats.innerHTML = statMarkup(items, now);
+    summary.innerHTML = summaryMarkup(items, now);
+    filters.innerHTML = filterMarkup(state, items, now);
+    sections.innerHTML = sectionsMarkup(items, state, now);
+    notice.innerHTML = noticeText;
   }
-  return [...map.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-}
 
-function applyFilters(items) {
-  const now = Date.now();
-  const q = filterState.q.trim().toLowerCase();
-  return items.filter((it) => {
-    const k = classify(it, now);
-    if (filterState.status === "taking" && k !== TAKING) return false;
-    if (filterState.status === "closing" && !(k === TAKING && Date.parse(it.deadline) - now <= 86400000)) return false;
-    if (filterState.status === "closed" && k !== CLOSED) return false;
-    if (filterState.fee === "free" && isPaid(it)) return false;
-    if (filterState.fee === "paid" && !isPaid(it)) return false;
-    if (filterState.category !== "all" && (it.category || "Other") !== filterState.category) return false;
-    if (q) {
-      const hay = (it.title + " " + (it.skills || []).join(" ") + " " + (it.sponsor ? it.sponsor.name : "") + " " + it.category).toLowerCase();
-      if (!hay.includes(q)) return false;
+  function accept(payload) {
+    const next = (Array.isArray(payload) ? payload : asList(payload?.items ?? payload?.competitions)).map(readCompetition);
+    for (const item of next) {
+      const before = previous.get(item.slug);
+      if (before !== undefined && item.entries !== null && item.entries > before) events.unshift({ handle: '', title: item.title, time: Date.now() });
     }
-    return true;
+    previous = new Map(next.map((item) => [item.slug, item.entries ?? 0]));
+    events = events.slice(0, 5);
+    if (!events.length) events = initialEvents(payload);
+    items = next;
+    paint();
+    paintTicker();
+  }
+
+  filters.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-filter]');
+    if (!button) return;
+    state[button.dataset.filter] = button.dataset.value;
+    paint();
   });
-}
-
-function sortItems(items) {
-  const now = Date.now();
-  const copy = items.slice();
-  const s = filterState.sort;
-  copy.sort((a, b) => {
-    if (s === "pot") return (Number(b.potUsd) || 0) - (Number(a.potUsd) || 0);
-    if (s === "entries") return (Number(b.submissionCount) || 0) - (Number(a.submissionCount) || 0);
-    if (s === "value") return valuePerEntry(b) - valuePerEntry(a);
-    const ad = Date.parse(a.deadline) || Infinity;
-    const bd = Date.parse(b.deadline) || Infinity;
-    const aPast = ad <= now, bPast = bd <= now;
-    if (aPast !== bPast) return aPast ? 1 : -1;
-    return ad - bd;
+  filters.addEventListener('change', (event) => {
+    if (!event.target.matches('[data-sort]')) return;
+    state.sort = event.target.value;
+    paint();
   });
-  return copy;
-}
+  const onSearch = (event) => {
+    state.query = String(event.detail?.query ?? '').trim().toLowerCase();
+    paint();
+  };
+  document.addEventListener('potscope:search', onSearch);
 
-function feeCell(item) {
-  if (isPaid(item)) return el("span", { class: "fee-paid", title: "Paid entry fee" }, "$" + Number(item.entryFeeUsd).toFixed(2));
-  return el("span", { class: "fee-free" }, "FREE");
-}
-
-function timeCell(item, now) {
-  const left = timeLeft(item.deadline, now);
-  const p = progress(item, now);
-  const closed = left === "closed";
-  const bar = el("div", { class: "bar", title: "Elapsed share of the entry window" }, el("i", { class: closed ? "late" : "", style: "width:" + p.toFixed(1) + "%" }));
-  return el("div", { class: "tleft" }, closed ? "closed" : left, bar);
-}
-
-function row(item, now) {
-  const slug = item.slug;
-  const pot = Number(item.potUsd) || 0;
-  const val = valuePerEntry(item);
-  const paidRow = isPaid(item);
-  const tr = el("tr", null,
-    el("td", null,
-      el("a", { class: "btitle", href: "#/bounty/" + encodeURIComponent(slug) }, esc(item.title || slug))),
-    el("td", { class: "right" }, el("span", { class: "money paid" }, money2(pot))),
-    feeCell(item),
-    timeCell(item, now),
-    el("td", { class: "right" }, num(Number(item.submissionCount) || 0)),
-    el("td", { class: "right paid" }, el("span", { class: "money" }, money2(val))),
-  );
-  if (paidRow) tr.classList.add("paidrow");
-  return tr;
-}
-
-function renderTable() {
-  const now = Date.now();
-  const items = sortItems(applyFilters(boardItems));
-  const frag = document.createDocumentFragment();
-  for (const it of items) frag.append(row(it, now));
-  tableRoot.replaceChildren(frag);
-  return frag.children.length;
-}
-
-function filtersBar(items) {
-  const c = statusCounts(items);
-  const frag = document.createDocumentFragment();
-  const statusGroup = el("div", { class: "fgroup" }, el("span", { class: "flabel" }, "Status"));
-  const statusOpts = [
-    ["all", "All", c.all],
-    ["taking", "Taking entries", c.taking],
-    ["closing", "Closing soon", c.closing],
-    ["closed", "Closed", c.closed],
-  ];
-  for (const [k, lab, count] of statusOpts) {
-    const b = el("button", {
-      class: "pill", type: "button", "data-st": k, "aria-pressed": String(filterState.status === k),
-      onclick: () => { filterState.status = k; syncPills(statusGroup, "st", k); renderTable(); },
-    }, lab, el("span", { class: "c" }, String(count)));
-    statusGroup.append(b);
+  const result = await fetchBoard();
+  if (!context.isActive()) {
+    document.removeEventListener('potscope:search', onSearch);
+    return;
   }
-
-  const feeGroup = el("div", { class: "fgroup" }, el("span", { class: "flabel" }, "Fee"));
-  const feeOpts = [
-    ["any", "Any", items.length],
-    ["free", "Free", items.filter((i) => !isPaid(i)).length],
-    ["paid", "Paid", items.filter((i) => isPaid(i)).length],
-  ];
-  for (const [k, lab, count] of feeOpts) {
-    const b = el("button", {
-      class: "pill", type: "button", "data-fee": k, "aria-pressed": String(filterState.fee === k),
-      onclick: () => { filterState.fee = k; syncPills(feeGroup, "fee", k); renderTable(); },
-    }, lab, el("span", { class: "c" }, String(count)));
-    feeGroup.append(b);
+  if (!result.data) {
+    noticeText = `<div class="notice notice-error">${result.error?.status === 404 ? 'The board endpoint answered not found.' : 'The live board could not be loaded. Check the connection and try again.'}</div>`;
+    paint();
+    document.removeEventListener('potscope:search', onSearch);
+    return;
   }
+  if (result.stale) noticeText = '<div class="notice">Showing the last board while a fresh copy loads.</div>';
+  accept(result.data);
 
-  const catGroup = el("div", { class: "fgroup" }, el("span", { class: "flabel" }, "Category"));
-  const cats = categoryCounts(items);
-  const allCat = el("button", {
-    class: "pill", type: "button", "data-cat": "all", "aria-pressed": String(filterState.category === "all"),
-    onclick: () => { filterState.category = "all"; syncPills(catGroup, "cat", "all"); renderTable(); },
-  }, "All", el("span", { class: "c" }, String(items.length)));
-  catGroup.append(allCat);
-  for (const [cat, count] of cats) {
-    const b = el("button", {
-      class: "pill", type: "button", "data-cat": cat, "aria-pressed": String(filterState.category === cat),
-      onclick: () => { filterState.category = cat; syncPills(catGroup, "cat", cat); renderTable(); },
-    }, cat, el("span", { class: "c" }, String(count)));
-    catGroup.append(b);
-  }
-
-  const sortWrap = el("div", { class: "fgroup" }, el("span", { class: "flabel" }, "Sort"));
-  const sel = el("select", { class: "sort", "aria-label": "Sort bounties" },
-    el("option", { value: "closing" }, "Closing soonest"),
-    el("option", { value: "pot" }, "Biggest pot"),
-    el("option", { value: "entries" }, "Most entries"),
-    el("option", { value: "value" }, "Best value/entry"),
-  );
-  sel.value = filterState.sort;
-  sel.addEventListener("change", () => { filterState.sort = sel.value; renderTable(); });
-  sortWrap.append(sel);
-
-  frag.append(statusGroup, feeGroup, catGroup, el("div", { class: "spacer" }), sortWrap);
-  return frag;
-}
-
-function syncPills(group, attr, value) {
-  for (const b of group.querySelectorAll(".pill")) {
-    b.setAttribute("aria-pressed", String(b.getAttribute("data-" + attr) === value));
-  }
-}
-
-export function setSearch(q) {
-  filterState.q = q || "";
-  renderTable();
-}
-
-export async function render(container, ctx = {}) {
-  container.replaceChildren(el("div", { class: "loading" }, "Loading the board…"));
-  try {
-    const { body, stale, refreshFailed } = await getBoard();
-    boardItems = Array.isArray(body.items) ? body.items : [];
-    primeTicker(boardItems);
-    startTicker();
-
-    const hero = boardHero();
-    const statsRow = summaryStrip(boardItems);
-    const frag = document.createDocumentFragment();
-    if (refreshFailed) frag.append(el("div", { class: "offline" }, "Could not refresh — showing the last cached board."));
-    else if (stale) frag.append(el("div", { class: "offline" }, "Refreshing in the background — showing cached data."));
-    frag.append(hero, statsRow, filtersBar(boardItems));
-    tableRoot = el("div", { id: "board-table" });
-    frag.append(tableRoot);
-    container.replaceChildren(frag);
-    renderTable();
-    ctx.onLoaded && ctx.onLoaded(boardItems);
-    return () => { tableRoot = null; };
-  } catch (err) {
-    const msg = err instanceof ApiError && err.status === 404 ? "The board endpoint returned 404." : "Could not reach make.fun. Check your connection and retry.";
-    container.replaceChildren(el("div", { class: "err" }, msg + " ",
-      el("button", { class: "pill", type: "button", onclick: () => render(container, ctx) }, "Retry")));
-    throw err;
-  }
+  const poll = window.setInterval(async () => {
+    if (!context.isActive()) return;
+    const fresh = await fetchBoard();
+    if (context.isActive() && fresh.data) accept(fresh.data);
+  }, POLL_MS);
+  const rotate = window.setInterval(() => { tick += 1; paintTicker(); }, ROTATE_MS);
+  context.signal.addEventListener('abort', () => {
+    window.clearInterval(poll);
+    window.clearInterval(rotate);
+    document.removeEventListener('potscope:search', onSearch);
+  }, { once: true });
 }

@@ -1,390 +1,408 @@
-// leaderboard.js — lazy-loaded per-bounty board (50 rows a page, handle search,
-// metric-adaptive score column + 90% interval, medals for the top 3) and the
-// top-builders surface (rank medals, win rate, entries, rewards).
+// Lazy detail views: a bounty leaderboard with client-side paging and search,
+// metric-aware score columns, and the top-builders surface. The router loads
+// this module only when one of those routes is visited.
 
-import { getBounty, getLeaderboard, getTopBuilders } from "../api-detail.js";
-import { num, money2, el } from "../format.js";
-import { pct, score, intervalRange, money, dateShort, avatar, apiUrl } from "../format-detail.js";
+import { API_ORIGIN, LIST_FRESH_MS, boardUrl, bountyUrl, cacheGet, fetchBoard, fetchCached, leaderboardUrl } from '../api.js';
+import {
+  buildPrizeIndex,
+  loadBuilders,
+  mergeLeaderboardRows,
+  prizeForRow,
+  readColumns,
+  readRankKey,
+} from '../api-detail.js';
+import { formatDate, formatNumber } from '../format.js';
+import {
+  formatInterval,
+  formatLeaderboardValue,
+  formatPrize,
+} from '../format-detail.js';
+import { asList, escapeHtml, handleOf, pickFirst, toFiniteNumber } from './common.js';
 
 const PAGE_SIZE = 50;
+const INTERVAL_NOTE = '90 percent confidence interval';
 
-let state = null;
-
-function held(container) {
-  container.replaceChildren(el("div", { class: "held" }, "Scores held until the final run."));
+function safeImageUrl(value) {
+  const source = value && typeof value === 'object' ? (value.url ?? value.url_small ?? '') : value;
+  const text = String(source ?? '').trim();
+  if (!text) return '';
+  if (text.startsWith('/')) return `${API_ORIGIN}${text}`;
+  return /^https?:\/\//i.test(text) ? text : '';
 }
 
-function metricLabel(rankKey, columns, b) {
-  const key = String(rankKey || "");
-  if (key.includes("judge")) return "Judge win rate";
-  if (key.includes("elo")) return "Elo";
-  if (key.includes("log_score") || key.includes("loss")) return "Log score";
-  if (key.includes("probability")) return "Probability";
-  if (key.includes("distance")) return "Distance";
-  const col = (columns || []).find((c) => c.key === key);
-  return col ? col.title : key || "Score";
+// The anonymous cross-origin attribute is written before the source so the
+// browser already holds it when it starts the image request.
+function avatarMarkup(row, className = 'avatar') {
+  if (row?.stub) return '';
+  const url = safeImageUrl(pickFirst(row ?? {}, ['image', 'avatar', 'avatar_url', 'avatarUrl']));
+  if (!url) return `<div class="${className}" aria-hidden="true"></div>`;
+  return `<img class="${className}" crossorigin="anonymous" alt="" src="${escapeHtml(url)}">`;
 }
 
-function metricUnit(rankKey, b) {
-  const key = String(rankKey || "");
-  if (key.includes("judge")) return "millionths";
-  if (key.includes("elo")) return "elo";
-  if (key.includes("probability")) return "probability";
-  if (key.includes("distance")) return "km";
-  return "";
+function rankMarkup(rank) {
+  const value = toFiniteNumber(rank);
+  if (value === null || value < 1) return '<span class="rank-cell">—</span>';
+  if (value <= 3) return `<span class="rank-cell"><span class="rank-medal rank-medal-${value}">${formatNumber(value)}</span></span>`;
+  return `<span class="rank-cell">${formatNumber(value)}</span>`;
 }
 
-function prizeLookup(b) {
-  const map = new Map();
-  const rw = Array.isArray(b.rewardsNow) ? b.rewardsNow : [];
-  for (const r of rw) {
-    const place = Number(r.place);
-    if (!Number.isInteger(place) || place <= 0) continue;
-    let amount = r.amountUsd !== undefined && r.amountUsd !== null ? r.amountUsd : null;
-    if (amount === null && (r.baseUsd !== undefined || r.feeShareUsd !== undefined)) {
-      amount = (Number(r.baseUsd) || 0) + (Number(r.feeShareUsd) || 0);
-    }
-    if (amount !== null) map.set(place, amount);
-  }
-  if (!map.size && b.rewards && typeof b.rewards === "object") {
-    for (const [place, amount] of Object.entries(b.rewards)) {
-      const n = Number(place);
-      if (Number.isInteger(n) && n > 0) map.set(n, amount);
-    }
-  }
-  if (b.rewards && typeof b.rewards === "object") {
-    for (const [place, amount] of Object.entries(b.rewards)) {
-      const n = Number(place);
-      if (Number.isInteger(n) && n > 0 && !map.has(n)) map.set(n, amount);
-    }
-  }
-  return map;
+function readScoreColumn(columns, rankKey) {
+  const list = asList(columns);
+  const direct = list.find((column) => typeof column === 'object' && String(column.key ?? '') === rankKey);
+  if (direct) return direct;
+  const named = list.find((column) => /judge|win|elo|score|loss|profit/i.test(`${column?.key ?? ''} ${column?.title ?? ''}`));
+  if (named) return named;
+  return { key: rankKey || 'score', title: rankKey === 'elo' ? 'Elo' : '' };
 }
 
-/** The paid place for a row: prize_rank, falling back to its overall rank. */
-function paidPlace(r) {
-  const pr = Number(r.prize_rank);
-  if (Number.isInteger(pr) && pr > 0) return pr;
-  const rank = Number(r.rank);
-  return Number.isInteger(rank) && rank > 0 ? rank : null;
+function scoreLabel(rankKey, column) {
+  const words = `${rankKey ?? ''} ${column?.title ?? ''} ${column?.key ?? ''}`.toLowerCase();
+  if (/judge|win[_\s-]*rate|winrate/.test(words)) return 'Judge win rate';
+  if (/\belo\b/.test(words)) return 'Elo';
+  if (/\bloss\b/.test(words)) return 'Loss';
+  if (column?.title) return String(column.title);
+  return 'Score';
 }
 
-/** Score value for a full row (values keyed by column) or a stub (scalar value/display). */
-function rowValue(r, rankKey) {
-  if (r.values && typeof r.values === "object") {
-    if (r.values[rankKey] !== undefined && r.values[rankKey] !== null) return r.values[rankKey];
-    const keys = Object.keys(r.values);
-    if (keys.length) return r.values[keys[0]];
-  }
-  const value = r.value;
-  if (value && typeof value === "object") {
-    if (value[rankKey] !== undefined && value[rankKey] !== null) return value[rankKey];
-    const keys = Object.keys(value);
-    if (keys.length) return value[keys[0]];
-  }
-  if (value !== undefined && value !== null) return value;
-  if (r.performance !== undefined && r.performance !== null) return r.performance;
-  if (r.display && typeof r.display === "object") {
-    if (r.display[rankKey] !== undefined && r.display[rankKey] !== null) return r.display[rankKey];
-  }
-  if (typeof r.display === "string" || typeof r.display === "number") return r.display;
-  return null;
+function intervalMarkup(row, column) {
+  const interval = pickFirst(row, ['interval', 'confidence', 'confidence_interval', 'confidenceInterval']) ?? {};
+  const values = row?.values && typeof row.values === 'object' ? row.values : {};
+  const low = pickFirst(interval, ['low', 'min', 'lower']) ?? pickFirst(row, ['low', 'judge_low', 'judgeLow']) ?? pickFirst(values, ['judge_low', 'judgeLow', 'low']);
+  const high = pickFirst(interval, ['high', 'max', 'upper']) ?? pickFirst(row, ['high', 'judge_high', 'judgeHigh']) ?? pickFirst(values, ['judge_high', 'judgeHigh', 'high']);
+  const text = formatInterval(low, high, column);
+  return text === '—' ? '' : `<span class="score-interval" title="${INTERVAL_NOTE}">${escapeHtml(text)}</span>`;
 }
 
-function blankAvatar(size) {
-  return el("span", { class: "avatar", "aria-hidden": "true", style: "display:inline-block;width:" + size + "px;height:" + size + "px" });
+function validMarkup(row) {
+  const values = row?.values && typeof row.values === 'object' ? row.values : {};
+  const valid = values.valid ?? pickFirst(row, ['valid', 'is_valid', 'isValid', 'valid_entry', 'validEntry']);
+  if (valid === true || toFiniteNumber(valid) === 1) return '<span class="valid-check" aria-label="Valid entry">✓</span>';
+  return '';
 }
 
-/** Format a row score, keeping any preformatted display string as-is. */
-function scoreText(value, label, unit) {
-  if (value === null || value === undefined || value === "") return "—";
-  if (typeof value === "string" && value.trim() !== "" && !Number.isFinite(Number(value))) return value;
-  return score(value, label, unit);
+function receivedOf(row) {
+  return pickFirst(row, ['received_at', 'received', 'receivedAt', 'received_date', 'date', 'submitted_at']);
 }
 
-const MEDALS = { 1: "gold", 2: "silver", 3: "bronze" };
-
-function rankCell(rank, cls) {
-  const n = Number(rank);
-  if (MEDALS[n]) {
-    return el("td", { class: "rank" + (cls ? " " + cls : "") },
-      el("span", { class: "medal " + MEDALS[n], title: "#" + n + " place" }, String(n)));
-  }
-  return el("td", { class: "rank" + (cls ? " " + cls : "") }, "#" + num(rank));
+function rewardSource(payload, slug) {
+  const competition = payload?.competition && typeof payload.competition === 'object' ? payload.competition : {};
+  const directNow = competition.rewardsNow ?? payload?.rewardsNow;
+  if (directNow) return directNow;
+  const cachedBounty = cacheGet(bountyUrl(slug))?.data;
+  const cachedCompetition = cachedBounty?.competition && typeof cachedBounty.competition === 'object' ? cachedBounty.competition : cachedBounty;
+  const cachedNow = cachedCompetition?.rewardsNow;
+  if (cachedNow) return cachedNow;
+  const boardItems = cacheGet(boardUrl())?.data?.items;
+  const boardCompetition = asList(boardItems).find((entry) => String(entry?.slug ?? '') === String(slug));
+  if (boardCompetition?.rewardsNow) return boardCompetition.rewardsNow;
+  return competition.rewards ?? payload?.rewards ?? cachedCompetition?.rewards ?? boardCompetition?.rewards;
 }
 
-function buildHead(b, columns, rankKey) {
-  const label = metricLabel(rankKey, columns, b);
-  return el("thead", null, el("tr", null,
-    el("th", null, "Rank"),
-    el("th", null, "Entrant"),
-    el("th", { class: "right" }, label),
-    el("th", { class: "right hidesm" }, "Prize"),
-    el("th", { class: "right hidesm" }, "Valid"),
-    el("th", { class: "hidesm" }, "Received"),
-  ));
+function readChoices(payload, keys) {
+  return asList(pickFirst(payload ?? {}, keys)).map((entry) => {
+    if (typeof entry === 'string') return { key: entry, title: entry };
+    return {
+      key: String(pickFirst(entry ?? {}, ['key', 'name', 'slug', 'value']) ?? ''),
+      title: String(pickFirst(entry ?? {}, ['title', 'label', 'name', 'key']) ?? ''),
+    };
+  }).filter((choice) => choice.key && !/cost|efficien/i.test(`${choice.key} ${choice.title}`));
 }
 
-function buildBody(b, rows, columns, rankKey, unit) {
-  const label = metricLabel(rankKey, columns, b);
-  const prizes = prizeLookup(b);
-  const tbody = el("tbody");
-  for (const r of rows) {
-    const img = r.image ? avatar(apiUrl(r.image), 24, r.handle) : blankAvatar(24);
-    const iv = r.interval ? intervalRange(r.interval.low, r.interval.high, label, unit) : "";
-    const place = paidPlace(r);
-    let prize = place !== null && prizes.has(place) ? prizes.get(place) : null;
-    if (prize === null) {
-      const rowPrize = r.prize_usd !== undefined && r.prize_usd !== null ? r.prize_usd
-        : r.prizeUsd !== undefined && r.prizeUsd !== null ? r.prizeUsd : null;
-      if (rowPrize !== null) prize = rowPrize;
-    }
-    const prizeText = prize !== null ? money2(prize) : "—";
-    const value = rowValue(r, rankKey);
-    tbody.append(el("tr", null,
-      rankCell(r.rank, r.rank <= 3 ? "top" : ""),
-      el("td", null, el("div", { class: "entrant" }, img,
-        el("div", { class: "et" },
-          el("a", { class: "h", href: "#/u/" + encodeURIComponent(r.handle) }, "@" + (r.handle || "")),
-          el("div", { class: "ti", title: r.title || "" }, r.title || "—"),
-        ))),
-      el("td", { class: "right" }, el("span", { class: "score" }, scoreText(value, label, unit)),
-        iv ? el("span", { class: "iv", title: "90% confidence interval" }, iv) : null),
-      el("td", { class: "right hidesm" }, prize !== null ? el("span", { class: "money" }, prizeText) : "—"),
-      el("td", { class: "right hidesm" }, r.values && Number(r.values.valid) ? el("span", { class: "chk" }, "✓") : "—"),
-      el("td", { class: "hidesm muted", style: "white-space:nowrap;font-size:12px" }, dateShort(r.received_at)),
-    ));
-  }
-  return tbody;
+// The phase and view controls come from the leaderboard response when it
+// carries them, or from the competition's leaderboard info in the cached
+// bounty payload. Cost and efficiency views always answer 404 when signed
+// out, so readChoices filters those out.
+function offeredChoices(payload, slug, keys, boardKeys) {
+  const direct = readChoices(payload, keys);
+  if (direct.length) return direct;
+  const cachedBounty = cacheGet(bountyUrl(slug))?.data;
+  const competition = cachedBounty?.competition && typeof cachedBounty.competition === 'object' ? cachedBounty.competition : cachedBounty;
+  const board = pickFirst(competition ?? {}, ['leaderboard', 'leaderboard_info', 'leaderboardInfo', 'board']);
+  return board && typeof board === 'object' ? readChoices(board, boardKeys) : [];
 }
 
-function pager(total, page, onPage) {
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const wrap = el("div", { class: "pager" });
-  const prev = el("button", { type: "button", onclick: () => onPage(page - 1) }, "‹ Prev");
-  prev.disabled = page <= 1;
-  wrap.append(prev, el("span", { class: "info" }, "Page " + page + " of " + pages));
-  const nums = [];
-  for (let p = 1; p <= pages; p++) {
-    if (pages <= 9 || p === 1 || p === pages || Math.abs(p - page) <= 1) nums.push(p);
-    else if (nums[nums.length - 1] !== "…") nums.push("…");
-  }
-  for (const n of nums) {
-    if (n === "…") { wrap.append(el("span", { class: "info" }, "…")); continue; }
-    const b = el("button", { type: "button", "aria-current": n === page ? "page" : null, onclick: () => onPage(n) }, String(n));
-    wrap.append(b);
-  }
-  const next = el("button", { type: "button", onclick: () => onPage(page + 1) }, "Next ›");
-  next.disabled = page >= pages;
-  wrap.append(next);
-  return wrap;
+function leaderboardAddress(slug, state) {
+  const base = leaderboardUrl(slug);
+  const params = [];
+  if (state.phasePicked && state.phase) params.push(`phase=${encodeURIComponent(state.phase)}`);
+  if (state.viewPicked && state.view) params.push(`view=${encodeURIComponent(state.view)}`);
+  return params.length ? `${base}&${params.join('&')}` : base;
 }
 
-function renderTableArea() {
-  if (!state) return;
-  const { container, b, data } = state;
-  const host = container.querySelector("#lb-table");
-  if (!host) return;
-  const rankKey = data.rank_key || (b.leaderboard && b.leaderboard.rankKey) || "judge";
-  const columns = Array.isArray(data.columns) ? data.columns : [];
-  const unit = metricUnit(rankKey);
-  const q = state.q.trim().toLowerCase();
+function titleOf(payload, fallback) {
+  const competition = payload?.competition && typeof payload.competition === 'object' ? payload.competition : {};
+  return String(pickFirst(competition, ['title', 'name']) ?? pickFirst(payload ?? {}, ['title', 'competition_title', 'competitionTitle']) ?? fallback);
+}
 
-  const full = Array.isArray(data.entries) ? data.entries : [];
-  const rest = Array.isArray(data.rest) ? data.rest : [];
-  const seen = new Set();
+function pageNumbers(current, total) {
+  const wanted = new Set([1, total, current - 1, current, current + 1]);
+  return [...wanted].filter((page) => page >= 1 && page <= total).sort((left, right) => left - right);
+}
+
+export async function renderLeaderboard(root, context) {
+  const slug = String(context.route?.slug ?? '');
+  context.setTitle('Leaderboard');
+  const state = { page: 1, query: '', phase: '', view: '', phasePicked: false, viewPicked: false };
+  let payload = null;
   let rows = [];
-  for (const r of full.concat(rest)) {
-    if (r.rank === null || r.rank === undefined) continue;
-    const key = r.submission_id ? "s:" + r.submission_id : "r:" + r.rank + ":" + (r.handle || "") + ":" + (r.title || "");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    rows.push(r);
+  let scoreColumn = null;
+  let prizes = new Map();
+  let scoresVisible = true;
+  let trueTotal = 0;
+  let noticeText = '';
+
+  root.innerHTML = `<div data-head></div><div class="notice" data-notice hidden></div>
+    <div class="board-toolbar" data-toolbar hidden></div>
+    <div data-rows></div><div class="pagination" data-pager></div>`;
+
+  const head = root.querySelector('[data-head]');
+  const notice = root.querySelector('[data-notice]');
+  const toolbar = root.querySelector('[data-toolbar]');
+  const rowsRegion = root.querySelector('[data-rows]');
+  const pager = root.querySelector('[data-pager]');
+
+  function showNotice(text) {
+    noticeText = text;
+    notice.textContent = text;
+    notice.hidden = !text;
   }
-  if (q) rows = rows.filter((r) => (r.handle || "").toLowerCase().includes(q) || (r.title || "").toLowerCase().includes(q));
-  rows.sort((a, c) => a.rank - c.rank);
 
-  const total = rows.length;
+  function filteredRows() {
+    const query = state.query.trim().toLowerCase();
+    if (!query) return rows;
+    return rows.filter((row) => `${handleOf(row)} ${pickFirst(row, ['title', 'entry_title', 'entryTitle']) ?? ''}`.toLowerCase().includes(query));
+  }
 
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-  const page = Math.min(state.page, pages);
-  state.page = page;
-  const slice = rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-  const table = el("table", null, buildHead(b, columns, rankKey), buildBody(b, slice, columns, rankKey, unit));
-  const frag = el("div", null,
-    el("div", { class: "muted", style: "font-size:12px;margin-bottom:4px" },
-      num(total) + " ranked" + (q ? " matching “" + q + "”" : "") + " · " + PAGE_SIZE + " per page"),
-    el("div", { class: "tablewrap" }, table),
-    pager(total, page, (p) => { state.page = p; renderTableArea(); }),
-  );
-  host.replaceChildren(frag);
+  function paintHead() {
+    const title = titleOf(payload, slug);
+    head.innerHTML = `<div class="section-head"><div><h1>Leaderboard</h1>
+      <p>${escapeHtml(title)} · ${formatNumber(trueTotal)} ranked</p></div>
+      <a class="button button-secondary button-small" href="#/bounty/${encodeURIComponent(slug)}">Bounty page</a></div>`;
+  }
+
+  function toggleGroup(label, choices, key, current) {
+    if (choices.length < 2) return '';
+    return `<span class="filter-row-label">${escapeHtml(label)}</span><div class="toggle-group" role="group" aria-label="${escapeHtml(label)}">${choices.map((choice) => `<button type="button" class="toggle-option" data-toggle="${key}" data-value="${escapeHtml(choice.key)}" aria-pressed="${choice.key === current}">${escapeHtml(choice.title || choice.key)}</button>`).join('')}</div>`;
+  }
+
+  function paintToolbar() {
+    const phases = offeredChoices(payload, slug, ['phases', 'windows'], ['phases', 'windows']);
+    const views = offeredChoices(payload, slug, ['views', 'view_options', 'viewOptions'], ['views', 'view_options', 'viewOptions']);
+    toolbar.innerHTML = `<input class="handle-search" type="search" placeholder="Find a handle" aria-label="Find a handle" value="${escapeHtml(state.query)}" spellcheck="false">
+      ${toggleGroup('Phase', phases, 'phase', state.phase)}${toggleGroup('View', views, 'view', state.view)}
+      <span class="board-total">${formatNumber(trueTotal)} ranked entries</span>`;
+    toolbar.hidden = false;
+  }
+
+  function paintRows() {
+    if (!scoresVisible) {
+      rowsRegion.innerHTML = '<div class="held-note">Scores held until the final run</div>';
+      pager.innerHTML = '';
+      return;
+    }
+    const visible = filteredRows();
+    const prizeMarkup = (row) => {
+      const amount = prizeForRow(row, prizes);
+      return amount === null ? '—' : formatPrize(amount);
+    };
+    const pages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+    state.page = Math.min(Math.max(1, state.page), pages);
+    const start = (state.page - 1) * PAGE_SIZE;
+    const slice = visible.slice(start, start + PAGE_SIZE);
+    const label = scoreLabel(readRankKey(payload), scoreColumn);
+    const body = slice.map((row) => {
+      const rank = row.rank;
+      const handle = handleOf(row);
+      const entryTitle = pickFirst(row, ['title', 'entry_title', 'entryTitle']);
+      return `<tr><td>${rankMarkup(rank)}</td>
+        <td><div class="entrant-cell">${avatarMarkup(row)}<div>${handle ? `<a class="entrant-name" href="#/user/${encodeURIComponent(handle)}">@${escapeHtml(handle)}</a>` : '<span class="entrant-name">Anonymous</span>'}${entryTitle ? `<span class="entrant-entry" title="${escapeHtml(entryTitle)}">${escapeHtml(entryTitle)}</span>` : ''}</div></div></td>
+        <td class="num"><span class="score-cell">${escapeHtml(formatLeaderboardValue(row, scoreColumn))}</span>${intervalMarkup(row, scoreColumn)}</td>
+        <td class="num prize-cell">${escapeHtml(prizeMarkup(row))}</td>
+        <td>${validMarkup(row)}</td>
+        <td><span class="mono-date">${escapeHtml(formatDate(receivedOf(row)))}</span></td></tr>`;
+    }).join('');
+    rowsRegion.innerHTML = visible.length
+      ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Rank</th><th>Entrant</th><th class="num">${escapeHtml(label)}</th><th class="num">Prize</th><th>Valid</th><th>Received</th></tr></thead><tbody>${body}</tbody></table></div>`
+      : `<div class="empty-state"><h2>No handles match “${escapeHtml(state.query)}”</h2><p>Clear the search box to see every ranked entry.</p></div>`;
+    paintPager(visible, pages, label);
+  }
+
+  function paintPager(visible, pages, label) {
+    if (!visible.length) {
+      pager.innerHTML = '';
+      return;
+    }
+    const numbers = pageNumbers(state.page, pages);
+    let buttons = '';
+    let previous = 0;
+    for (const page of numbers) {
+      if (previous && page - previous > 1) buttons += '<span class="pager-info">…</span>';
+      buttons += `<button type="button" class="page-button" data-page="${page}" aria-current="${page === state.page ? 'page' : 'false'}">${formatNumber(page)}</button>`;
+      previous = page;
+    }
+    pager.innerHTML = `<button type="button" class="page-button" data-page="${state.page - 1}" ${state.page <= 1 ? 'disabled' : ''} aria-label="Previous page">Previous</button>${buttons}<button type="button" class="page-button" data-page="${state.page + 1}" ${state.page >= pages ? 'disabled' : ''} aria-label="Next page">Next</button><span class="pager-info">Page ${formatNumber(state.page)} of ${formatNumber(pages)} · ${formatNumber(visible.length)} ranked</span>`;
+    pager.setAttribute('aria-label', `${label} pages`);
+  }
+
+  function paint() {
+    paintHead();
+    paintToolbar();
+    paintRows();
+    notice.hidden = !noticeText;
+  }
+
+  function accept(data) {
+    payload = data;
+    rows = mergeLeaderboardRows(data);
+    scoreColumn = readScoreColumn(readColumns(data), readRankKey(data));
+    prizes = buildPrizeIndex(rewardSource(data, slug));
+    const phase = data?.phase && typeof data.phase === 'object' ? data.phase : {};
+    const held = pickFirst(phase, ['scores_visible', 'scoresVisible', 'scores_live', 'scoresLive'])
+      ?? pickFirst(data, ['scores_visible', 'scoresVisible', 'scores_live', 'scoresLive']);
+    scoresVisible = held !== false;
+    const competition = data?.competition && typeof data.competition === 'object' ? data.competition : {};
+    trueTotal = rows.length
+      || toFiniteNumber(pickFirst(data, ['total', 'total_rows', 'totalRows', 'total_entries', 'totalEntries', 'ranked', 'count']))
+      || toFiniteNumber(pickFirst(competition, ['submissionCount'])) || 0;
+    const offeredPhase = String(pickFirst(data, ['phase', 'current_phase']) ?? '');
+    const offeredView = String(pickFirst(data, ['view', 'current_view']) ?? '');
+    const phases = offeredChoices(data, slug, ['phases', 'windows'], ['phases', 'windows']);
+    const views = offeredChoices(data, slug, ['views', 'view_options', 'viewOptions'], ['views', 'view_options', 'viewOptions']);
+    if (!state.phasePicked && phases.length) {
+      state.phase = phases.some((choice) => choice.key === offeredPhase) ? offeredPhase : phases[0].key;
+    }
+    if (!state.viewPicked && views.length) {
+      state.view = views.some((choice) => choice.key === offeredView) ? offeredView : views[0].key;
+    }
+  }
+
+  // A leaderboard deep link can paint before the warmed board cache lands, and
+  // the leaderboard payload itself carries no rewards list. Await the shared
+  // board fetch so the prize column fills from that competition's rewardsNow.
+  async function fillPrizes() {
+    if (prizes.size > 0) return;
+    const board = await fetchBoard();
+    const item = asList(board.data?.items).find((entry) => String(entry?.slug ?? '') === slug);
+    if (item) prizes = buildPrizeIndex(asList(item.rewardsNow).length ? item.rewardsNow : item.rewards);
+  }
+
+  async function load() {
+    const result = await fetchCached(leaderboardAddress(slug, state), { ttl: LIST_FRESH_MS });
+    if (!context.isActive()) return;
+    if (!result.data) {
+      const missing = result.error?.status === 404;
+      head.innerHTML = '<div class="section-head"><div><h1>Leaderboard</h1><p>Ranked entries for this bounty</p></div><a class="button button-secondary button-small" href="#/bounty/' + encodeURIComponent(slug) + '">Bounty page</a></div>';
+      rowsRegion.innerHTML = `<div class="empty-state"><h2>${missing ? 'Leaderboard not found' : 'Leaderboard could not load'}</h2>
+        <p>${missing ? 'No leaderboard exists at this address.' : 'The make.fun API did not answer just now. Try again shortly.'}</p>
+        <p><button type="button" class="button button-primary" data-retry>Try again</button></p></div>`;
+      pager.innerHTML = '';
+      toolbar.hidden = true;
+      showNotice('');
+      return;
+    }
+    accept(result.data);
+    await fillPrizes();
+    if (!context.isActive()) return;
+    showNotice(result.stale ? 'Showing the last loaded leaderboard while a fresh copy arrives.' : '');
+    paint();
+  }
+
+  toolbar.addEventListener('input', (event) => {
+    if (!event.target.matches('.handle-search')) return;
+    state.query = event.target.value;
+    state.page = 1;
+    paintRows();
+  });
+
+  toolbar.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-toggle]');
+    if (!button) return;
+    const key = button.dataset.toggle;
+    if (state[key] === button.dataset.value) return;
+    state[key] = button.dataset.value;
+    if (key === 'phase') state.phasePicked = true;
+    if (key === 'view') state.viewPicked = true;
+    state.page = 1;
+    paintToolbar();
+    rowsRegion.setAttribute('aria-busy', 'true');
+    const result = await fetchCached(leaderboardAddress(slug, state), { ttl: LIST_FRESH_MS });
+    if (!context.isActive()) return;
+    rowsRegion.removeAttribute('aria-busy');
+    if (result.data) {
+      accept(result.data);
+      await fillPrizes();
+      if (!context.isActive()) return;
+      showNotice(result.stale ? 'Showing the last loaded leaderboard while a fresh copy arrives.' : '');
+      paint();
+    } else {
+      showNotice('That view could not be loaded. The current rows are unchanged.');
+    }
+  });
+
+  pager.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-page]');
+    if (!button || button.disabled) return;
+    const page = toFiniteNumber(button.dataset.page);
+    if (page === null) return;
+    state.page = page;
+    paintRows();
+    root.scrollIntoView({ block: 'start' });
+  });
+
+  rowsRegion.addEventListener('click', (event) => {
+    if (event.target.closest('[data-retry]')) load();
+  });
+
+  await load();
 }
 
-export async function render(container, ctx = {}) {
-  const slug = ctx.params && ctx.params.slug;
-  if (!slug) {
-    container.replaceChildren(el("div", { class: "err" }, "No bounty in this URL."));
+function builderRecord(row) {
+  const record = pickFirst(row, ['record', 'stats', 'counts']);
+  return record && typeof record === 'object' ? record : {};
+}
+
+export async function renderBuilders(root, context) {
+  context.setTitle('Top Builders');
+  root.innerHTML = `<div class="section-head"><div><h1>Leaderboard</h1><p>Top builders on make.fun</p></div></div>
+    <div class="notice" data-notice hidden></div><div data-rows><p class="loading-line">Loading the top builders…</p></div>`;
+  const notice = root.querySelector('[data-notice]');
+  const region = root.querySelector('[data-rows]');
+
+  const result = await loadBuilders();
+  if (!context.isActive() || !result) return;
+  if (!result.data) {
+    const missing = result.error?.status === 404;
+    region.innerHTML = `<div class="empty-state"><h2>${missing ? 'Rankings not found' : 'Rankings could not load'}</h2>
+      <p>${missing ? 'The rankings endpoint answered not found.' : 'The make.fun API did not answer just now. Try again shortly.'}</p>
+      <p><a class="button button-primary" href="#/">Back to the board</a></p></div>`;
     return;
   }
-  container.replaceChildren(el("div", { class: "loading" }, "Loading leaderboard…"));
-  const phase = ctx.query && ctx.query.get("phase") || "";
-  const view = ctx.query && ctx.query.get("view") || "";
-
-  try {
-    const { body: b } = await getBounty(slug);
-    const { body: data } = await getLeaderboard(slug, { phase, view });
-    const phaseInfo = data.phase || {};
-    const title = b.title || slug;
-    const rankKey = data.rank_key || (b.leaderboard && b.leaderboard.rankKey) || "judge";
-    const columns = Array.isArray(data.columns) ? data.columns : [];
-    const unit = metricUnit(rankKey);
-
-    state = { container, b, data, page: 1, q: "" };
-
-    const head = el("div", null,
-      el("div", { class: "crumb" }, el("a", { href: "#/" }, "Board"), " / ",
-        el("a", { href: "#/bounty/" + encodeURIComponent(slug) }, title), " / Leaderboard"),
-      el("div", { class: "lb-head" },
-        el("h1", null, "Leaderboard"),
-        el("span", { class: "badge " + (phaseInfo.scores_visible === false ? "closed" : "live") },
-          phaseInfo.scores_visible === false ? "Scores held" : (phaseInfo.title || "Live")),
-      ),
-      el("div", { class: "muted", style: "font-size:12px" },
-        title + " · " + metricLabel(rankKey, columns, b) + (unit === "millionths" ? " (win rate)" : "") +
-        " · scores " + (phaseInfo.scores === "live" ? "live" : "after finalize"),
-      ),
-    );
-
-    const tools = el("div", { class: "lb-tools" });
-    const search = el("input", { type: "search", placeholder: "Find a handle", "aria-label": "Find a handle on this leaderboard" });
-    search.addEventListener("input", () => { state.q = search.value; state.page = 1; renderTableArea(); });
-    tools.append(search);
-
-    const phases = Array.isArray(b.phases) ? b.phases : [];
-    if (phases.length > 1) {
-      const tg = el("div", { class: "toggle" });
-      for (const p of phases) {
-        const btn = el("button", {
-          type: "button", "aria-pressed": String((phase || data.phase && data.phase.key || "dev") === p.key),
-          onclick: async () => {
-            if (state.phaseBusy) return;
-            state.phaseBusy = true;
-            try {
-              const { body: next } = await getLeaderboard(slug, { phase: p.key, view });
-              state.data = next;
-              state.page = 1;
-              for (const x of tg.children) x.setAttribute("aria-pressed", String(x === btn));
-              renderTableArea();
-            } catch { /* keep the current board */ }
-            state.phaseBusy = false;
-          },
-        }, p.title || p.key);
-        tg.append(btn);
-      }
-      tools.append(el("span", { class: "faint" }, "Phase"), tg);
-    }
-    const views = Array.isArray(data.views) ? data.views.filter((v) => v === "overall" || v === "performance") : [];
-    if (views.length > 1) {
-      const vg = el("div", { class: "toggle" });
-      for (const v of views) {
-        const btn = el("button", {
-          type: "button", "aria-pressed": String((view || data.view || "performance") === v),
-          onclick: async () => {
-            const { body: next } = await getLeaderboard(slug, { phase: data.phase ? data.phase.key : phase, view: v });
-            state.data = next;
-            state.page = 1;
-            for (const x of vg.children) x.setAttribute("aria-pressed", String(x === btn));
-            renderTableArea();
-          },
-        }, v === "overall" ? "Overall" : "Performance");
-        vg.append(btn);
-      }
-      tools.append(el("span", { class: "faint" }, "View"), vg);
-    }
-
-    const host = el("div", { id: "lb-table" });
-    container.replaceChildren(head, tools, host);
-
-    if (phaseInfo.scores_visible === false) {
-      held(host);
-    } else {
-      renderTableArea();
-    }
-  } catch (err) {
-    container.replaceChildren(el("div", { class: "err" },
-      "Could not load this leaderboard. ", el("a", { href: "#/bounty/" + encodeURIComponent(slug) }, "Back to the bounty")));
-    throw err;
+  notice.hidden = !result.stale;
+  notice.textContent = result.stale ? 'Showing the last loaded rankings while a fresh copy arrives.' : '';
+  const rows = result.rows;
+  if (!rows.length) {
+    region.innerHTML = '<div class="empty-state"><h2>No builders ranked yet</h2><p>The rankings list is empty right now.</p></div>';
+    return;
   }
+  const body = rows.map((row, index) => {
+    const rank = toFiniteNumber(pickFirst(row, ['rank', 'position', 'place'])) ?? index + 1;
+    const handle = handleOf(row);
+    const verified = pickFirst(row, ['verified', 'is_verified', 'isVerified']) === true;
+    const record = builderRecord(row);
+    const entered = toFiniteNumber(record.competitions_entered);
+    const placed = toFiniteNumber(record.competitions_placed);
+    const won = toFiniteNumber(record.competitions_won);
+    const best = toFiniteNumber(record.best_placement);
+    const rewards = record.prize_usd;
+    return `<tr><td>${rankMarkup(rank)}</td>
+      <td><div class="builder-cell">${avatarMarkup(row)}<div>${handle ? `<a class="entrant-name" href="#/user/${encodeURIComponent(handle)}">@${escapeHtml(handle)}</a>` : '<span class="entrant-name">Anonymous</span>'}${verified ? '<span class="verified" aria-label="Verified builder">✓</span>' : ''}</div></div></td>
+      <td class="num">${formatNumber(entered)}</td>
+      <td class="num">${formatNumber(placed)}</td>
+      <td class="num">${formatNumber(won)}</td>
+      <td class="num">${best !== null && best >= 1 ? `#${formatNumber(best)}` : '—'}</td>
+      <td class="num prize-cell">${escapeHtml(formatPrize(rewards))}</td>
+      <td><a class="button button-secondary button-small" href="#/user/${encodeURIComponent(handle)}">View</a></td></tr>`;
+  }).join('');
+  region.innerHTML = `<div class="table-wrap"><table class="data-table builder-table"><thead><tr><th>Rank</th><th>Builder</th><th class="num">Entries</th><th class="num">Placed</th><th class="num">Won</th><th class="num">Best</th><th class="num">Rewards</th><th></th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
-// ---- Top builders surface (#/builders) ----
-
-function builderRank(rank) {
-  const n = Number(rank);
-  if (MEDALS[n]) return el("span", { class: "medal " + MEDALS[n], title: "#" + n + " place" }, String(n));
-  return el("span", { class: "muted", style: "font-variant-numeric:tabular-nums;font-weight:700" }, "#" + num(rank));
-}
-
-function winRate(rec) {
-  const entered = Number(rec.competitions_entered) || 0;
-  return entered ? pct((Number(rec.competitions_won) || 0) / entered * 100, 1) : "—";
-}
-
-export async function renderBuilders(container) {
-  container.replaceChildren(el("div", { class: "loading" }, "Loading top builders…"));
-  try {
-    const { body } = await getTopBuilders();
-    const items = Array.isArray(body.items) ? body.items : [];
-
-    const head = el("div", { class: "lb-head" },
-      el("h1", null, "Leaderboard"),
-      el("div", { class: "muted", style: "font-size:13px;width:100%" }, "Top builders on make.fun"),
-    );
-
-    const tbody = el("tbody");
-    for (const row of items) {
-      const rec = row.record || {};
-      const img = row.image
-        ? avatar(apiUrl(row.image), 26, row.handle)
-        : el("span", { class: "avatar", "aria-hidden": "true", style: "display:inline-block;width:26px;height:26px" });
-      tbody.append(el("tr", null,
-        el("td", { class: "rank" }, builderRank(row.rank)),
-        el("td", null, el("div", { class: "entrant" }, img,
-          el("div", { class: "et" },
-            el("a", { class: "h", href: "#/u/" + encodeURIComponent(row.handle) },
-              row.display_name || ("@" + row.handle),
-              row.verified === true ? el("span", { class: "chk", title: "Verified" }, " ✓") : null),
-            el("div", { class: "ti" }, "@" + (row.handle || "")),
-          ))),
-        el("td", { class: "right" }, winRate(rec)),
-        el("td", { class: "right hidesm muted", title: "Not provided by the API" }, "—"),
-        el("td", { class: "right" }, num(rec.competitions_entered)),
-        el("td", { class: "right" }, el("span", { class: "money" }, money(rec.prize_usd))),
-        el("td", { class: "right" }, el("a", { class: "btn ghost sm", href: "#/u/" + encodeURIComponent(row.handle) }, "View")),
-      ));
-    }
-
-    const table = el("table", null,
-      el("thead", null, el("tr", null,
-        el("th", null, "Rank"), el("th", null, "Builder"),
-        el("th", { class: "right" }, "Win rate"), el("th", { class: "right hidesm" }, "90% CI"),
-        el("th", { class: "right" }, "Entries"), el("th", { class: "right" }, "Rewards"),
-        el("th", { class: "right" }, ""),
-      )),
-      tbody,
-    );
-
-    const frag = el("div", null,
-      head,
-      items.length ? el("div", { class: "tablewrap" }, table) : el("div", { class: "empty" }, "No builders ranked yet."),
-    );
-    container.replaceChildren(frag);
-  } catch {
-    container.replaceChildren(el("div", { class: "err" }, "Could not load top builders."));
-    throw new Error("builders failed");
-  }
-}
-
-export function teardown() {
-  state = null;
-}

@@ -1,228 +1,237 @@
-// profile.js — lazy-loaded public profile: card layout with avatar/handle,
-// five stat boxes, recent activity built from real solutions/payouts,
-// entries table, payouts panel and a motivational strip.
+// Lazy profile view: the public record of one handle, its five stat boxes,
+// links, recent activity, entries, payouts, and a friendly missing state.
 
-import { getProfile } from "../api-detail.js";
-import { num, money2, el } from "../format.js";
-import { dateShort, profileScore, avatar, apiUrl, placeLabel } from "../format-detail.js";
+import { API_ORIGIN } from '../api.js';
+import { loadProfile, readProfileCard } from '../api-detail.js';
+import { formatDate, formatMoney, formatNumber, formatRelativeTime } from '../format.js';
+import { formatPlacement, formatPrize, formatSolutionScore, shortenAddress } from '../format-detail.js';
+import { asList, escapeHtml, pickFirst, toFiniteNumber } from './common.js';
 
-function svg(paths) {
-  const ns = "http://www.w3.org/2000/svg";
-  const node = document.createElementNS(ns, "svg");
-  node.setAttribute("viewBox", "0 0 24 24");
-  node.setAttribute("fill", "none");
-  node.setAttribute("stroke", "currentColor");
-  node.setAttribute("stroke-width", "1.8");
-  node.setAttribute("stroke-linecap", "round");
-  node.setAttribute("stroke-linejoin", "round");
-  node.setAttribute("aria-hidden", "true");
-  node.setAttribute("width", "16");
-  node.setAttribute("height", "16");
-  for (const d of paths) {
-    const p = document.createElementNS(ns, "path");
-    p.setAttribute("d", d);
-    node.append(p);
+const MISSING = '—';
+const RECENT_LIMIT = 5;
+
+function safeImageUrl(value) {
+  const source = value && typeof value === 'object' ? (value.url ?? value.url_small ?? '') : value;
+  const text = String(source ?? '').trim();
+  if (!text) return '';
+  if (text.startsWith('/')) return `${API_ORIGIN}${text}`;
+  return /^https?:\/\//i.test(text) ? text : '';
+}
+
+function asAddress(value) {
+  const text = String(value ?? '').trim();
+  return /^https?:\/\//i.test(text) ? text : '';
+}
+
+function profileLink(card, pageUrl) {
+  const direct = asAddress(pageUrl);
+  if (direct) return direct;
+  return card.handle ? `${API_ORIGIN}/@${encodeURIComponent(card.handle)}` : API_ORIGIN;
+}
+
+function verifiedMarkup(profilePayload) {
+  return pickFirst(profilePayload ?? {}, ['verified', 'is_verified', 'isVerified']) === true
+    ? '<span class="verified" aria-label="Verified account">✓</span>'
+    : '';
+}
+
+function statBox(label, value) {
+  return `<div class="stat-box"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`;
+}
+
+function statBoxes(record) {
+  const dash = (value) => (value === null || value === undefined ? MISSING : value);
+  return `<div class="stat-boxes">
+    ${statBox('Entered', formatNumber(dash(record.entered)))}
+    ${statBox('Placed', formatNumber(dash(record.placed)))}
+    ${statBox('Won', formatNumber(dash(record.won)))}
+    ${statBox('Best Place', record.best === null || record.best < 1 ? MISSING : `#${formatNumber(record.best)}`)}
+    ${statBox('Total Rewards', formatMoney(record.rewards))}</div>`;
+}
+
+function linkMarkup(card) {
+  const links = [];
+  const githubLogin = card.github && typeof card.github === 'object'
+    ? pickFirst(card.github, ['login', 'handle', 'name'])
+    : card.github;
+  if (githubLogin) {
+    const login = String(githubLogin);
+    links.push(`<a href="https://github.com/${encodeURIComponent(login)}" rel="noopener">GitHub</a>`);
   }
-  return node;
-}
-
-const CHECK = ["M20 6L9 17l-5-5"];
-
-function statBox(k, v, cls) {
-  return el("div", { class: "p-stat" },
-    el("div", { class: "k" }, k),
-    el("div", { class: "v" + (cls ? " " + cls : "") }, v),
-  );
-}
-
-function links(p) {
-  const wrap = el("div", { class: "links" });
-  if (p.github_login) wrap.append(el("a", { href: "https://github.com/" + encodeURIComponent(p.github_login), rel: "noopener" }, "GitHub"));
-  if (p.discord && p.discord.url) wrap.append(el("a", { href: p.discord.url, rel: "noopener" }, "Discord"));
-  if (p.x && p.x.url) wrap.append(el("a", { href: p.x.url, rel: "noopener" }, "X"));
-  if (p.wallet && p.wallet.explorer_url) wrap.append(el("a", { href: p.wallet.explorer_url, rel: "noopener" }, "Wallet"));
-  return wrap;
-}
-
-function entriesTable(p) {
-  const rows = (p.solutions || []).slice().sort((a, b) => {
-    const ap = a.placement === null || a.placement === undefined ? Infinity : Number(a.placement);
-    const bp = b.placement === null || b.placement === undefined ? Infinity : Number(b.placement);
-    if (ap !== bp) return ap - bp;
-    return Date.parse(b.entered_at || 0) - Date.parse(a.entered_at || 0);
-  });
-  const tbody = el("tbody");
-  for (const s of rows) {
-    const comp = s.competition || {};
-    const sc = s.score || {};
-    const col = sc.column || {};
-    const rawScore = sc.value !== null && sc.value !== undefined ? sc.value : sc.display;
-    tbody.append(el("tr", null,
-      el("td", null, el("a", { class: "btitle", href: "#/bounty/" + encodeURIComponent(comp.slug) }, comp.title || comp.slug || "—")),
-      el("td", { class: "hidesm", style: "max-width:40ch" }, el("div", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap", title: s.title || "" }, s.title || "—")),
-      el("td", null, s.placement !== null && s.placement !== undefined ? "#" + num(s.placement) : "—"),
-      el("td", { class: "right" }, s.prize_usd !== null && s.prize_usd !== undefined ? el("span", { class: "money" }, money2(s.prize_usd)) : "—"),
-      el("td", { class: "right score" }, rawScore !== null && rawScore !== undefined && rawScore !== "" ? profileScore(rawScore, col) : "—"),
-      el("td", { class: "hidesm muted", style: "white-space:nowrap;font-size:12px" }, dateShort(s.entered_at)),
-    ));
+  const discord = asAddress(card.discord && typeof card.discord === 'object' ? card.discord.url : card.discord);
+  if (discord) links.push(`<a href="${escapeHtml(discord)}" rel="noopener">Discord</a>`);
+  if (card.x) {
+    const handle = String(card.x).replace(/^@/, '');
+    links.push(`<a href="https://x.com/${encodeURIComponent(handle)}" rel="noopener">X</a>`);
   }
-  return el("div", { class: "tablewrap" }, el("table", null,
-    el("thead", null, el("tr", null,
-      el("th", null, "Competition"), el("th", { class: "hidesm" }, "Entry"),
-      el("th", null, "Place"), el("th", { class: "right" }, "Prize"),
-      el("th", { class: "right" }, "Score"), el("th", { class: "hidesm" }, "Entered"),
-    )),
-    tbody,
-  ));
+  const walletUrl = asAddress(card.walletUrl);
+  if (walletUrl) links.push(`<a href="${escapeHtml(walletUrl)}" rel="noopener">Wallet</a>`);
+  else if (card.wallet) links.push(`<a href="https://explorer.solana.com/address/${encodeURIComponent(String(card.wallet))}" rel="noopener">Wallet</a>`);
+  if (!links.length) return '';
+  const separator = '<span class="muted" aria-hidden="true">·</span>';
+  return `<div class="profile-links">${links.join(separator)}</div>`;
 }
 
-function payoutsPanel(p) {
-  const list = (p.payouts || []).slice().sort((a, b) => Date.parse(b.paid_at || 0) - Date.parse(a.paid_at || 0));
-  const panel = el("div", { class: "panel" }, el("h2", null, "Payouts"));
-  if (!list.length) {
-    panel.append(el("div", { class: "muted", style: "font-size:12px" }, "No prizes paid yet."));
-    return panel;
-  }
-  const tbody = el("tbody");
-  for (const p2 of list) {
-    const comp = p2.competition || {};
-    tbody.append(el("tr", null,
-      el("td", { class: "hidesm muted", style: "white-space:nowrap" }, dateShort(p2.paid_at)),
-      el("td", null, placeLabel(p2.place)),
-      el("td", null, el("a", { href: "#/bounty/" + encodeURIComponent(comp.slug) }, comp.title || comp.slug || "—")),
-      el("td", { class: "right" }, el("span", { class: "money" }, money2(p2.amount_usd))),
-      el("td", { class: "right" }, p2.explorer_url ? el("a", { href: p2.explorer_url, rel: "noopener", title: p2.signature || "" }, "tx ↗") : "—"),
-    ));
-  }
-  panel.append(el("div", { class: "tablewrap" }, el("table", null,
-    el("thead", null, el("tr", null,
-      el("th", { class: "hidesm" }, "Date"), el("th", null, "Place"),
-      el("th", null, "Competition"), el("th", { class: "right" }, "Amount"), el("th", { class: "right" }, "Tx"),
-    )),
-    tbody,
-  )));
-  return panel;
+function headerCard(card, pageUrl, profilePayload) {
+  const image = safeImageUrl(card.image);
+  const avatar = image
+    ? `<img class="profile-avatar" crossorigin="anonymous" alt="" src="${escapeHtml(image)}">`
+    : '<div class="profile-avatar" aria-hidden="true"></div>';
+  const name = card.displayName && card.displayName !== card.handle
+    ? `<p class="profile-name">${escapeHtml(String(card.displayName))}</p>`
+    : '';
+  const bio = card.bio ? `<p class="profile-bio">${escapeHtml(String(card.bio))}</p>` : '';
+  return `<section class="profile-card">${avatar}
+    <h1 class="profile-handle">@${escapeHtml(card.handle)}${verifiedMarkup(profilePayload)}</h1>${name}${bio}
+    <p class="button-row"><a class="button button-primary" href="${escapeHtml(profileLink(card, pageUrl))}" rel="noopener">View on make.fun</a></p>
+    ${linkMarkup(card)}${statBoxes(card.record)}</section>`;
 }
 
-/** Recent activity from real solutions[] and payouts[] only. */
-function recentActivity(p) {
+function competitionTitle(solution) {
+  const competition = pickFirst(solution, ['competition', 'competitions']);
+  if (competition && typeof competition === 'object') {
+    return String(pickFirst(competition, ['title', 'name']) ?? 'a bounty');
+  }
+  return String(pickFirst(solution, ['competition_title', 'competitionTitle', 'competition', 'title']) ?? 'a bounty');
+}
+
+function solutionDate(solution) {
+  return pickFirst(solution, ['entered_at', 'enteredAt', 'created_at', 'createdAt', 'date']);
+}
+
+function payoutDate(payout) {
+  return pickFirst(payout, ['paid_at', 'paidAt', 'date', 'created_at']);
+}
+
+function payoutAmount(payout) {
+  const value = pickFirst(payout, ['amount_usd', 'amount', 'prize_usd']);
+  return value === undefined ? null : value;
+}
+
+function activityEvents(card) {
   const events = [];
-  for (const s of p.solutions || []) {
-    const comp = s.competition || {};
-    const at = s.entered_at || null;
+  for (const solution of asList(card.solutions)) {
+    const at = solutionDate(solution);
     if (!at) continue;
-    if (s.prize_usd !== null && s.prize_usd !== undefined && Number(s.prize_usd) > 0) {
-      events.push({ kind: "payout", at, text: "Won " + (comp.title || comp.slug || "a bounty"), amount: s.prize_usd, href: comp.slug });
-    } else {
-      events.push({ kind: "entry", at, text: "Entered " + (comp.title || comp.slug || "a bounty"), href: comp.slug });
+    events.push({ kind: 'Entered', title: competitionTitle(solution), at, time: Date.parse(at) });
+  }
+  for (const payout of asList(card.payouts)) {
+    const at = payoutDate(payout);
+    if (!at) continue;
+    const amount = payoutAmount(payout);
+    events.push({ kind: 'Won', title: competitionTitle(payout), at, amount: amount === null ? null : formatMoney(amount), time: Date.parse(at) });
+  }
+  return events.filter((event) => Number.isFinite(event.time)).sort((left, right) => right.time - left.time).slice(0, RECENT_LIMIT);
+}
+
+function activityCard(card) {
+  const events = activityEvents(card);
+  const body = events.length
+    ? `<div class="activity-list">${events.map((event) => `<div class="activity-item">
+        <p><strong>${event.kind}</strong> ${escapeHtml(event.title)}${event.amount ? ` · <span class="payout-amount">${escapeHtml(event.amount)}</span>` : ''}</p>
+        <span class="activity-time" title="${escapeHtml(formatDate(event.at))}">${escapeHtml(formatRelativeTime(event.at))}</span></div>`).join('')}</div>`
+    : '<p class="card-note">No dated activity has been published for this account yet.</p>';
+  return `<section class="card"><div class="card-head activity-head"><h2>Recent Activity</h2><span class="card-note">Latest public events</span></div>${body}</section>`;
+}
+
+function scoreOfSolution(solution) {
+  const score = pickFirst(solution, ['score', 'result']);
+  if (score === undefined) return MISSING;
+  return formatSolutionScore(score);
+}
+
+function prizeOfSolution(solution) {
+  const prize = solution?.prize_usd;
+  return prize === undefined || prize === null ? MISSING : formatPrize(prize);
+}
+
+function entriesTable(card) {
+  const rows = asList(card.solutions).slice().sort((left, right) => {
+    const leftPlace = toFiniteNumber(pickFirst(left, ['placement', 'place', 'rank']));
+    const rightPlace = toFiniteNumber(pickFirst(right, ['placement', 'place', 'rank']));
+    if (leftPlace === null && rightPlace === null) return 0;
+    if (leftPlace === null) return 1;
+    if (rightPlace === null) return -1;
+    return leftPlace - rightPlace;
+  });
+  if (!rows.length) return '<p class="card-note">This account has no published entries yet.</p>';
+  const body = rows.map((solution) => {
+    const competition = pickFirst(solution, ['competition', 'competitions']);
+    const slug = String(pickFirst(solution, ['competition_slug', 'competitionSlug', 'slug']) ?? pickFirst(competition ?? {}, ['slug']) ?? '');
+    const title = competitionTitle(solution);
+    const entryTitle = String(pickFirst(solution, ['title', 'entry_title', 'entryTitle']) ?? MISSING);
+    const placement = formatPlacement(pickFirst(solution, ['placement', 'place', 'rank']));
+    return `<tr><td><a class="bounty-title" href="#/bounty/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></td>
+      <td>${escapeHtml(entryTitle)}</td><td class="num placement">${placement === MISSING ? MISSING : `#${placement}`}</td>
+      <td class="num prize-cell">${escapeHtml(prizeOfSolution(solution))}</td><td class="num">${escapeHtml(scoreOfSolution(solution))}</td>
+      <td><span class="mono-date">${escapeHtml(formatDate(solutionDate(solution)))}</span></td></tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table class="data-table entries-table"><thead><tr><th>Bounty</th><th>Entry</th><th class="num">Place</th><th class="num">Prize</th><th class="num">Score</th><th>Entered</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function payoutLink(payout) {
+  const explorer = asAddress(pickFirst(payout, ['explorer', 'explorer_url', 'explorerUrl', 'tx_url', 'txUrl', 'url']));
+  if (explorer) return explorer;
+  const signature = pickFirst(payout, ['signature', 'tx', 'transaction']);
+  return signature ? `https://explorer.solana.com/tx/${encodeURIComponent(String(signature))}` : '';
+}
+
+function payoutsTable(card) {
+  const rows = asList(card.payouts);
+  if (!rows.length) return '<p class="card-note">No prizes have been paid to this account yet.</p>';
+  const body = rows.map((payout) => {
+    const competition = pickFirst(payout, ['competition', 'competitions']);
+    const slug = String(pickFirst(payout, ['competition_slug', 'competitionSlug', 'slug']) ?? pickFirst(competition ?? {}, ['slug']) ?? '');
+    const title = competitionTitle(payout);
+    const place = formatPlacement(pickFirst(payout, ['place', 'placement', 'rank']));
+    const amount = payoutAmount(payout);
+    const link = payoutLink(payout);
+    return `<tr><td><span class="mono-date">${escapeHtml(formatDate(payoutDate(payout)))}</span></td>
+      <td class="num placement">${place === MISSING ? MISSING : `#${place}`}</td>
+      <td><a class="bounty-title" href="#/bounty/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></td>
+      <td class="num payout-amount">${amount === null ? MISSING : escapeHtml(formatMoney(amount))}</td>
+      <td>${link ? `<a class="tx-link" href="${escapeHtml(link)}" rel="noopener">Transaction</a>` : `<span class="tx-link">${escapeHtml(shortenAddress(pickFirst(payout, ['signature', 'tx']), 5))}</span>`}</td></tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table class="data-table payouts-table"><thead><tr><th>Date</th><th class="num">Place</th><th>Bounty</th><th class="num">Amount</th><th>Transaction</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function missingCard(handle) {
+  return `<div class="empty-state"><h2>No profile for @${escapeHtml(handle)}</h2>
+    <p>make.fun has no public record for that handle. Check the spelling, or find the builder on the leaderboard.</p>
+    <p><a class="button button-primary" href="#/">Explore the board</a></p></div>`;
+}
+
+export async function renderProfile(root, context) {
+  const handle = String(context.route?.handle ?? '');
+  context.setTitle(handle ? `@${handle}` : 'Profile');
+  root.innerHTML = `<p class="loading-line">Loading the profile…</p>`;
+
+  const result = await loadProfile(handle);
+  if (!context.isActive()) return;
+
+  if (!result.data) {
+    if (result.error?.status === 404) {
+      root.innerHTML = missingCard(handle);
+      return;
     }
-  }
-  for (const p2 of p.payouts || []) {
-    const comp = p2.competition || {};
-    const at = p2.paid_at || null;
-    if (!at) continue;
-    events.push({
-      kind: "payout", at,
-      text: "Won " + (comp.title || comp.slug || "a bounty"),
-      amount: p2.amount_usd, href: comp.slug,
-    });
-  }
-  events.sort((a, b) => Date.parse(b.at || 0) - Date.parse(a.at || 0));
-  const seen = new Set();
-  const unique = [];
-  for (const e of events) {
-    const key = e.kind + ":" + e.text + ":" + (e.amount || "");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(e);
-  }
-  return unique.slice(0, 5);
-}
-
-function activityCard(p) {
-  const card = el("div", { class: "act-card" }, el("h3", null, "Recent Activity"));
-  const events = recentActivity(p);
-  if (!events.length) {
-    card.append(el("div", { class: "muted", style: "font-size:12px" }, "No activity yet."));
-    return card;
-  }
-  const list = el("div", { class: "act-list" });
-  for (const e of events) {
-    list.append(el("div", { class: "act-item" },
-      el("span", { class: "act-dot" + (e.kind === "payout" ? " payout" : "") }),
-      el("div", { class: "act-t" },
-        el("div", null, e.href ? el("a", { href: "#/bounty/" + encodeURIComponent(e.href) }, e.text) : e.text),
-        el("div", { class: "act-m" }, e.kind === "payout" ? "Prize paid" : "Entry submitted"),
-      ),
-      el("span", { class: "act-x" },
-        e.amount !== undefined && e.amount !== null ? el("span", { class: "money" }, money2(e.amount)) : dateShort(e.at)),
-    ));
-  }
-  card.append(list);
-  return card;
-}
-
-export async function render(container, ctx = {}) {
-  const handle = (ctx.params && ctx.params.handle) || "";
-  if (!handle) {
-    container.replaceChildren(el("div", { class: "err" }, "No handle in this URL."));
+    root.innerHTML = `<div class="empty-state"><h2>The profile could not load</h2>
+      <p>The make.fun API did not answer just now. Try again shortly.</p>
+      <p><a class="button button-primary" href="#/user/${encodeURIComponent(handle)}">Reload this profile</a></p></div>`;
     return;
   }
-  container.replaceChildren(el("div", { class: "loading" }, "Loading profile…"));
-  try {
-    const { body: p } = await getProfile(handle);
-    const rec = p.record || {};
-    const imgSrc = apiUrl((p.avatar && (p.avatar.url_small || p.avatar.url)) || p.image);
-    const name = p.display_name || p.handle || handle;
 
-    const dash = (v) => (v === undefined || v === null ? "—" : num(v));
-
-    const rank = p.rank || p.ranking || null;
-    const points = (rank && (rank.points ?? rank.score)) ?? p.points ?? null;
-    const topLine = points !== null
-      ? el("div", { class: "muted", style: "font-size:12px" }, "Top Builder • " + num(points) + " points")
-      : null;
-
-    const verified = p.verified === true || (p.badges && Array.isArray(p.badges) && p.badges.includes("verified"));
-
-    const leftCard = el("div", { class: "p-card" },
-      el("div", { class: "p-av" }, avatar(imgSrc, 72, name)),
-      el("div", { class: "p-name" }, name, verified ? el("span", { class: "chk", title: "Verified" }, svg(CHECK)) : null),
-      el("div", { class: "p-handle" }, "@" + (p.handle || handle)),
-      topLine,
-      p.bio ? el("p", { class: "p-bio" }, p.bio) : null,
-      el("div", { class: "muted", style: "font-size:12px;margin-top:6px" }, "Joined " + dateShort(p.joined_at)),
-      links(p),
-      p.wallet && p.wallet.address ? el("div", { class: "wallet mono", style: "margin-top:6px;font-size:11px;color:var(--muted);word-break:break-all" }, p.wallet.address) : null,
-      el("div", { class: "p-btn" },
-        el("a", { class: "btn", href: "https://make.fun/u/" + encodeURIComponent(p.handle || handle), rel: "noopener" }, "View on make.fun"),
-      ),
-      el("div", { class: "p-stats" },
-        statBox("Entries", dash(rec.competitions_entered)),
-        statBox("Placed", dash(rec.competitions_placed)),
-        statBox("Won", dash(rec.competitions_won)),
-        statBox("Best Place", rec.best_placement === undefined || rec.best_placement === null ? "—" : placeLabel(rec.best_placement)),
-        statBox("Total Rewards", rec.prize_usd === undefined || rec.prize_usd === null ? "—" : money2(rec.prize_usd), "money"),
-      ),
-    );
-
-    const rightCard = activityCard(p);
-    const grid = el("div", { class: "p-grid" }, leftCard, rightCard);
-
-    const entries = el("div", { class: "panel" },
-      el("h2", null, "Entries · " + num((p.solutions || []).length)),
-      (p.solutions || []).length ? entriesTable(p) : el("div", { class: "muted", style: "font-size:12px" }, "No entries yet."),
-    );
-
-    const motiv = el("div", { class: "p-motiv" },
-      el("div", { class: "t" }, "Keep building, keep competing!"),
-      el("a", { class: "btn", href: "#/" }, "Explore Bounties"),
-    );
-
-    container.replaceChildren(grid, entries, payoutsPanel(p), motiv);
-  } catch (err) {
-    container.replaceChildren(el("div", { class: "err" },
-      "No profile @" + handle + ". ", el("a", { href: "#/" }, "Back to the board")));
-    throw err;
+  const card = result.card ?? readProfileCard(result.data);
+  if (!card.handle) {
+    root.innerHTML = missingCard(handle);
+    return;
   }
+  context.setTitle(`@${card.handle}`);
+  const stale = result.stale ? '<div class="notice">Showing the last saved profile while a fresh copy arrives.</div>' : '';
+  const profilePayload = result.data?.profile && typeof result.data.profile === 'object' ? result.data.profile : result.data;
+  const pageUrl = pickFirst(result.data, ['page', 'url', 'profile_url', 'profileUrl'])
+    ?? pickFirst(profilePayload ?? {}, ['page', 'url', 'profile_url', 'profileUrl']);
+  root.innerHTML = `${stale}<div class="profile-layout">${headerCard(card, pageUrl, profilePayload)}${activityCard(card)}</div>
+    <section class="card"><div class="card-head"><h2>Entries</h2><span class="card-note">${formatNumber(card.solutions.length)} published</span></div>${entriesTable(card)}</section>
+    <section class="card"><div class="card-head"><h2>Payouts</h2><span class="card-note">Paid prizes</span></div>${payoutsTable(card)}</section>
+    <div class="motivational-strip"><p>Keep building, keep competing!</p><a class="button button-primary" href="#/">Explore Bounties</a></div>`;
 }
