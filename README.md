@@ -1,47 +1,30 @@
 # PotScope
 
-[![make.fun · makefun-frontend-01](https://make.fun/badge/makefun-frontend-01.svg)](https://make.fun/bounty/makefun-frontend-01?utm_source=github&utm_medium=readme&utm_campaign=makefun-frontend-01)
-[![rank](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/rank.svg)](https://make.fun/bounty/makefun-frontend-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=makefun-frontend-01)
-[![reward](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/reward.svg)](https://make.fun/bounty/makefun-frontend-01?utm_source=github&utm_medium=readme&utm_campaign=makefun-frontend-01)
+PotScope is a fast, static read of the public make.fun API: a live bounty board, each bounty's page and leaderboard, and any builder's public profile, all rendered from live data with no framework, no build step, and no sign-in.
 
-A static, no-build make.fun frontend: a live bounty board, bounty pages with
-live-pot reward math, paginated leaderboards, and public builder profiles. Reads
-the public make.fun API directly from the browser; no backend, no framework, no
-web font.
+[![make.fun competition badge](https://make.fun/badge/makefun-frontend-01.svg)](https://make.fun/bounty/makefun-frontend-01)
 
-## Run
+[![make.fun rank badge](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/rank.svg)](https://make.fun/bounty/makefun-frontend-01)
+
+[![make.fun reward badge](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/reward.svg)](https://make.fun/bounty/makefun-frontend-01)
+
+## Run it
 
 ```sh
-node serve.ts            # http://localhost:8080
+node serve.ts            # http://127.0.0.1:8080
 node serve.ts --port 9000
 ```
 
+The server serves `app/` on the loopback address. To package the entry with the dossier, run `MAKEFUN_OUTPUT_DIR=out node main.ts`.
+
 ## Routes
 
-- `#/` — bounty board (summary strip, live ticker, filters, live / opening soon / closed tables)
-- `#/bounty/<slug>` — bounty page (stat cards, rewards + fee-share bars, dates, judging, top 5, rules)
-- `#/bounty/<slug>/leaderboard` — full leaderboard, 50 rows per page, find-a-handle, 90% intervals
-- `#/u/<handle>` — public profile (5 stat cards, entries, payouts with explorer links)
-- `#/builders` — top builders by wins
+- `#/` — the bounty board: live, opening-soon, and closed bounties with live pot, fee, time left, entries, and value per entry.
+- `#/bounty/:slug` — one bounty: stat strip, tabs, rewards table with fee-share bars, dates, judging, rules, and a sidebar.
+- `#/bounty/:slug/leaderboard` — the full ranked leaderboard, 50 rows per page with search, medals, 90% intervals, prizes, and phase and view toggles.
+- `#/user/:handle` — a builder's profile: five stat boxes, recent activity, entries, and payouts.
+- `#/builders` — the top-builders surface.
 
 ## Performance
 
-- First load: `index.html` + `style.css` + `main.js` + `api.js` + `format.js` +
-  `views/board.js` (~11.9 KB gzipped total). Bounty, leaderboard and profile views load on
-  demand via `import()` together with `detail.css`, `api-detail.js` and `format-detail.js`.
-- One API request per view: board (`?activity=times`), bounty (`?submissions=summary`),
-  leaderboard (`?rows=first`), profile. The bounty page adds one `/live` call for the top-5 strip.
-- In-memory cache keyed by URL with ETag revalidation: fresh for 60s (lists) / 5min
-  (detail, profile), then stale-while-revalidate. Repeat visits inside the window cost zero.
-- No images on first load; avatars set `crossorigin="anonymous"` before `src`.
-
-## Package
-
-```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-```
-
-`main.ts` copies `app/` and `screenshots/` (if present) into the output directory and
-writes `dossier.json` via the vendor dossier builder. If `screenshots/` is absent it
-creates an empty output folder and leaves a `DOSSIER-PENDING.txt`; add the three
-screenshots named in `shots.json` and rerun to produce the dossier.
+The first load is one HTML shell, one stylesheet, and the router plus the API and formatting modules: about 11 KB gzipped (level 9) across the shell, style sheet, and those statically imported modules. The board and bounty views, their shared view helper, the leaderboard and profile views, the detail API and formatting modules, and the detail stylesheet all load lazily: the board route still paints immediately, but that payload sits outside the first load. Every API response is cached in memory with its ETag: lists and leaderboards stay fresh for 60 seconds, detail and profiles for 5 minutes, and stale bodies keep rendering while a conditional request revalidates them, so repeat visits inside a window make zero requests and a full four-surface tour makes four.

@@ -1,105 +1,130 @@
-// Packaging entry point: mirrors app/ and screenshots/ into the submission
-// output directory and emits dossier.json (or a pending marker when there are
-// no screenshots yet). Traversal is sorted and nothing time-dependent is
-// written, so repeated runs produce identical bytes.
+// PotScope entrypoint: package the static frontend and its screenshots into the
+// output directory and write the dossier the scorer reads.
+//
+//   MAKEFUN_OUTPUT_DIR=out node main.ts
+//
+// Node 22, standard library only. The copy walk is sorted and copies bytes, so
+// two runs against the same repository produce identical output.
 
-import { buildDossier } from "./vendor/makefun-frontend.ts";
-import { copyFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildDossier } from './vendor/makefun-frontend.ts';
 
-const SOURCE_DIR = import.meta.dirname;
-const TARGET_DIR = resolve(process.env.MAKEFUN_OUTPUT_DIR || "/output");
+const REPOSITORY_ROOT = dirname(fileURLToPath(import.meta.url));
+const OUTPUT_DIRECTORY = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const LIMITS = {
-  text_max_bytes: 163840,
-  screenshots: { max: 3, max_bytes: 262144 },
+const APP_SOURCE = join(REPOSITORY_ROOT, 'app');
+const SHOTS_SOURCE = join(REPOSITORY_ROOT, 'screenshots');
+
+const DOSSIER_LIMITS = {
+  text_max_bytes: 163_840,
+  screenshots: { max: 3, max_bytes: 262_144 },
   app_max_files: 993,
-  app_max_bytes: 16777216,
+  app_max_bytes: 16_777_216,
 };
 
-const PENDING_NOTE =
-  "No screenshots/ beside main.ts: dossier.json is written once the three screenshots are added.\n";
+type CopyTally = { files: number; bytes: number };
 
-async function isPresent(path) {
-  try {
-    await stat(path);
-    return true;
-  } catch {
-    return false;
-  }
+function listEntriesSorted(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true })
+    .map((entry) => entry.name)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 }
 
-async function inventory(root, prefix) {
-  const dirs = [];
-  const files = [];
-  const listing = await readdir(join(root, prefix || ""), { withFileTypes: true });
-  const byName = new Map(listing.map((item) => [item.name, item]));
-  const names = listing.map((item) => item.name).sort();
-  for (const name of names) {
-    const relative = prefix ? prefix + "/" + name : name;
-    const kind = byName.get(name);
-    if (kind.isDirectory()) {
-      dirs.push(relative);
-      const nested = await inventory(root, relative);
-      dirs.push(...nested.dirs);
-      files.push(...nested.files);
-    } else if (kind.isFile()) {
-      files.push(relative);
+// Recursively copy one source tree to one destination tree, visiting names in
+// sorted order and writing the same bytes the source holds. Symbolic links and
+// other special files are skipped: the submission gate refuses them anyway.
+function copyTree(source: string, destination: string, tally: CopyTally): void {
+  mkdirSync(destination, { recursive: true });
+  for (const name of listEntriesSorted(source)) {
+    const sourcePath = join(source, name);
+    const destinationPath = join(destination, name);
+    const stats = statSync(sourcePath);
+    if (stats.isDirectory()) {
+      copyTree(sourcePath, destinationPath, tally);
+    } else if (stats.isFile()) {
+      copyFileSync(sourcePath, destinationPath);
+      tally.files += 1;
+      tally.bytes += stats.size;
     }
   }
-  return { dirs, files };
 }
 
-async function mirror(from, to) {
-  const tree = await inventory(from, "");
-  await mkdir(to, { recursive: true });
-  for (const dir of tree.dirs) {
-    await mkdir(join(to, dir), { recursive: true });
-  }
-  for (const file of tree.files) {
-    await copyFile(join(from, file), join(to, file));
-  }
-  return tree.files.length;
+function describeRepositoryPath(path: string): string {
+  const shown = relative(REPOSITORY_ROOT, path) || '.';
+  return shown.split('\\').join('/');
 }
 
-async function packageEntry() {
-  await mkdir(TARGET_DIR, { recursive: true });
-
-  const appSource = join(SOURCE_DIR, "app");
-  if (!(await isPresent(appSource))) {
-    throw new Error("main.ts: app/ is missing beside main.ts");
-  }
-  const appCount = await mirror(appSource, join(TARGET_DIR, "app"));
-
-  const shotsSource = join(SOURCE_DIR, "screenshots");
-  const shotsTarget = join(TARGET_DIR, "screenshots");
-  let shotCount;
-  if (await isPresent(shotsSource)) {
-    shotCount = await mirror(shotsSource, shotsTarget);
-  } else {
-    await mkdir(shotsTarget, { recursive: true });
-    shotCount = 0;
-  }
-
-  let sealed = false;
-  if (shotCount > 0) {
-    await writeFile(join(TARGET_DIR, "dossier.json"), buildDossier(TARGET_DIR, LIMITS));
-    sealed = true;
-  } else {
-    await writeFile(join(TARGET_DIR, "DOSSIER-PENDING.txt"), PENDING_NOTE);
-  }
-
-  const tally =
-    "PotScope packaged -> " +
-    TARGET_DIR +
-    " (" +
-    appCount +
-    " app files, " +
-    shotCount +
-    " screenshots" +
-    (sealed ? ", dossier.json written" : ", dossier pending screenshots") +
-    ")";
-  console.log(tally);
+function hasScreenshots(): boolean {
+  if (!existsSync(SHOTS_SOURCE)) return false;
+  return listEntriesSorted(SHOTS_SOURCE).some((name) => {
+    const stats = statSync(join(SHOTS_SOURCE, name));
+    return stats.isFile();
+  });
 }
 
-await packageEntry();
+function writePendingNote(appTally: CopyTally, shotTally: CopyTally): void {
+  const lines = [
+    'PotScope dossier pending',
+    '',
+    'No screenshots were present when this package was built, so no dossier.json',
+    'was written. Add three screenshots under screenshots/ and run the entrypoint',
+    'again to produce the dossier.',
+    '',
+    `app files: ${appTally.files}`,
+    `app bytes: ${appTally.bytes}`,
+    `screenshot files: ${shotTally.files}`,
+    `screenshot bytes: ${shotTally.bytes}`,
+    '',
+  ];
+  writeFileSync(join(OUTPUT_DIRECTORY, 'dossier-pending.txt'), lines.join('\n'));
+}
+
+function packageRepository(): void {
+  if (!existsSync(APP_SOURCE)) {
+    throw new Error(`the app directory is missing at ${describeRepositoryPath(APP_SOURCE)}`);
+  }
+
+  mkdirSync(OUTPUT_DIRECTORY, { recursive: true });
+
+  const appTally: CopyTally = { files: 0, bytes: 0 };
+  const shotTally: CopyTally = { files: 0, bytes: 0 };
+
+  const appDestination = join(OUTPUT_DIRECTORY, 'app');
+  rmSync(appDestination, { recursive: true, force: true });
+  copyTree(APP_SOURCE, appDestination, appTally);
+
+  const shotsDestination = join(OUTPUT_DIRECTORY, 'screenshots');
+  rmSync(shotsDestination, { recursive: true, force: true });
+  mkdirSync(shotsDestination, { recursive: true });
+  const screenshotsReady = hasScreenshots();
+  if (screenshotsReady) copyTree(SHOTS_SOURCE, shotsDestination, shotTally);
+
+  const pendingPath = join(OUTPUT_DIRECTORY, 'dossier-pending.txt');
+  const dossierPath = join(OUTPUT_DIRECTORY, 'dossier.json');
+
+  if (!screenshotsReady) {
+    writePendingNote(appTally, shotTally);
+    if (existsSync(dossierPath)) rmSync(dossierPath);
+    console.log(
+      `packaged ${appTally.files} app files (${appTally.bytes} bytes) and ${shotTally.files} screenshots; dossier pending (no screenshots yet)`,
+    );
+    return;
+  }
+
+  writeFileSync(dossierPath, buildDossier(OUTPUT_DIRECTORY, DOSSIER_LIMITS));
+  if (existsSync(pendingPath)) rmSync(pendingPath);
+  const dossierBytes = statSync(dossierPath).size;
+  console.log(
+    `packaged ${appTally.files} app files (${appTally.bytes} bytes), ${shotTally.files} screenshots (${shotTally.bytes} bytes), dossier ${dossierBytes} bytes`,
+  );
+}
+
+try {
+  packageRepository();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`packaging failed: ${message}`);
+  process.exitCode = 1;
+}
