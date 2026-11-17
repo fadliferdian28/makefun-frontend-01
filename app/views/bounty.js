@@ -1,354 +1,590 @@
-// Bounty page: gradient header, live stat strip, in-page tabs, a rewards table
-// with fee-share bars, phase timeline, judging summary, top five preview, the
-// collapsible rules, an optional winner card, and a desktop sidebar.
+/**
+ * The bounty detail surface: the pane the board's split view shows beside the
+ * table, and the full page at #/bounty/<slug>.
+ *
+ * Both faces read the same live competition reply, so the pot, the fee math
+ * and the reward places can never drift apart.
+ *
+ * @module views/bounty
+ */
 
-import { fetchBounty } from '../api.js';
-import { formatDate, formatDateTime, formatMoney, formatNumber, formatRelativeTime, formatScore, formatTimeLeft, parseAmount } from '../format.js';
-import { asList, escapeHtml, handleOf, parseTimestamp, pickFirst, toFiniteNumber, toIso } from './common.js';
+import { MAKEFUN_ORIGIN, getBounty, getLeadersStrip } from '../api.js';
+import { getBountyWithLeaderboard } from '../api-detail.js';
+import {
+  firstLine,
+  formatDate,
+  formatDateTime,
+  formatDollars,
+  formatMoney,
+  formatNumber,
+  formatScore,
+  toNumber,
+} from '../format.js';
+import { formatCountdown, describeScoreColumn } from '../format-detail.js';
+import {
+  el,
+  emptyNote,
+  link,
+  renderMarkdown,
+  rewardsMathLine,
+  rewardsTable,
+  sectionBlock,
+  statStrip,
+} from './common.js';
 
-const SECOND = 1_000;
-const TABS = [['overview', 'Overview'], ['leaderboard', 'Leaderboard'], ['rules', 'Rules'], ['rewards', 'Rewards'], ['activity', 'Activity']];
-const ICONS = {
-  pot: '<circle cx="9" cy="9" r="5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12.5 6.6A5 5 0 1 1 9 17" fill="none" stroke="currentColor" stroke-width="1.8"/>',
-  fee: '<path d="M4 12h16M4 7h16M4 17h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
-  clock: '<circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7.5V12l3 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
-  entry: '<circle cx="9" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+const DASH = '—';
+const DEFAULTS = {
+  feePill: 'FREE',
+  visibleRewardPlaces: 10,
+  paneRewardPlaces: 5,
+  previewRows: 5,
+  activityRows: 5,
+  kitLabel: 'Download the starter kit',
 };
+const COUNTDOWN_MS = 1_000;
 
-const icon = (name) => `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">${ICONS[name]}</svg>`;
-const potOf = (item) => parseAmount(item?.potUsd);
-const feeOf = (item) => parseAmount(item?.entryFeeUsd);
-const feeTotalOf = (item) => parseAmount(item?.entryFeesUsd);
-const titleOf = (item) => String(pickFirst(item, ['title', 'name']) ?? 'Bounty');
-const slugOf = (item) => String(pickFirst(item, ['slug', 'competition_slug', 'id']) ?? '');
-const deadlineOf = (item) => parseTimestamp(item?.deadline);
-const publishOf = (item) => parseTimestamp(item?.publishedAt ?? item?.opensAt);
-const resultsOf = (item) => parseTimestamp(item?.resolvedAt);
-function entriesOf(item) {
-  return toFiniteNumber(item?.submissionCount);
-}
-function isOpen(item, now) {
-  const accepting = pickFirst(item, ['accepting_submissions', 'acceptingSubmissions', 'accepting']);
-  if (typeof accepting === 'boolean') return accepting;
-  const deadline = deadlineOf(item);
-  return deadline !== null && deadline > now;
-}
-
-function rewardsOf(item) {
-  return asList(item?.rewardsNow).map((row, index) => {
-    const base = parseAmount(row?.baseUsd);
-    const share = parseAmount(row?.feeShareUsd);
-    const amount = parseAmount(row?.amountUsd) ?? (base ?? 0) + (share ?? 0);
-    return { place: toFiniteNumber(row?.place) ?? index + 1, base, share, amount };
-  }).sort((left, right) => left.place - right.place);
-}
-
-function standingsOf(item) {
-  const board = pickFirst(item, ['leaderboard', 'standings', 'top_entries', 'topEntries']);
-  if (Array.isArray(board)) return board;
-  if (board && typeof board === 'object') {
-    const rows = pickFirst(board, ['entries', 'rows', 'items', 'standings']);
-    if (Array.isArray(rows)) return rows;
+/**
+ * The first defined value among several possible API field spellings.
+ * @param {Record<string, any>|null|undefined} source
+ * @param {string[]} keys
+ * @returns {any}
+ */
+function pick(source, keys) {
+  if (!source) return undefined;
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) return source[key];
   }
-  const submissions = pickFirst(item, ['submissions', 'entries']);
-  return Array.isArray(submissions) ? submissions : [];
+  return undefined;
 }
 
-function judgeMetricOf(item) {
-  const resolution = pickFirst(item ?? {}, ['resolution', 'judging']) ?? {};
-  const metric = pickFirst(resolution, ['metric', 'metric_name', 'metricName']) ?? {};
-  const words = typeof metric === 'object'
-    ? `${metric.name ?? ''} ${metric.unit ?? ''}`
-    : String(metric ?? '');
-  return /millionth|judge|win[\s_-]*rate/i.test(`${words} ${resolution.unit ?? ''}`);
+/** @param {any} bounty */
+function entryCount(bounty) {
+  return pick(bounty, ['submissionCount', 'entries', 'entry_count', 'submissions_count', 'submissions']);
 }
 
-function scoreText(row, judge) {
-  const direct = pickFirst(row, ['score_display', 'display', 'value_display']);
-  const value = pickFirst(row, ['score', 'value', 'judge_score']);
-  if (value && typeof value === 'object') return String(pickFirst(value, ['display', 'formatted']) ?? formatScore(pickFirst(value, ['value', 'score', 'judge'])));
-  if (judge) return formatScore(value ?? direct);
-  return direct !== undefined ? String(direct) : formatScore(value);
+/** @param {any} live */
+function liveStandings(live) {
+  const raw = pick(live, ['standings']);
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    const rows = pick(raw, ['rows']);
+    return Array.isArray(rows) ? rows : [];
+  }
+  const fallback = pick(live, ['entries', 'rows']);
+  return Array.isArray(fallback) ? fallback : [];
 }
 
-function renderInline(text) {
-  return text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, target) => (/^https?:\/\//i.test(target) ? `<a href="${target.replace(/"/g, '&quot;')}" rel="noopener">${label}</a>` : label))
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
-    .replace(/[*_]{1,2}/g, '');
+/** @param {any} bounty */
+function rewardsNow(bounty) {
+  const list = pick(bounty, ['rewards_now', 'rewardsNow', 'rewards']);
+  if (!Array.isArray(list)) return [];
+  return list.map((reward) => ({
+    place: pick(reward, ['place']),
+    base: pick(reward, ['baseUsd', 'base']),
+    fee_share: pick(reward, ['feeShareUsd', 'fee_share']),
+    amount: pick(reward, ['amountUsd', 'amount', 'total']),
+  }));
 }
 
-// Hand-rolled markdown: escape first, then headings, lists, emphasis, code,
-// quotes, and links. Unhandled markers are stripped, never shown raw.
-export function renderMarkdown(source) {
-  const lines = String(source ?? '').replace(/\r\n?/g, '\n').split('\n');
-  const out = [];
-  let paragraph = [];
-  let bullets = [];
-  let numbers = [];
-  let code = null;
-  const flushParagraph = () => {
-    if (paragraph.length) out.push(`<p>${renderInline(paragraph.join(' '))}</p>`);
-    paragraph = [];
+/** @param {any} bounty */
+function feeText(bounty) {
+  const fee = toNumber(pick(bounty, ['entryFeeUsd', 'entryFee', 'entry_fee', 'fee']));
+  return fee === null || fee === 0 ? DEFAULTS.feePill : formatDollars(fee);
+}
+
+/**
+ * The public bounty address on make.fun, from whichever field the reply uses.
+ * @param {any} bounty
+ * @param {string} slug Fallback route segment.
+ * @returns {string}
+ */
+function bountyAddress(bounty, slug) {
+  const raw = pick(bounty, ['page', 'url', 'link', 'page_url', 'bounty_url']);
+  if (typeof raw === 'string' && /^https?:\/\//.test(raw)) return raw;
+  if (typeof raw === 'string' && raw.startsWith('/')) return `${MAKEFUN_ORIGIN}${raw}`;
+  return `${MAKEFUN_ORIGIN}/bounty/${encodeURIComponent(slug)}`;
+}
+
+/** @param {any} bounty */
+function bountyState(bounty) {
+  const accepting = pick(bounty, ['accepting_submissions', 'acceptingSubmissions']);
+  const deadline = Date.parse(pick(bounty, ['deadline', 'ends_at', 'end']) ?? '');
+  if (accepting === false) return { live: false, label: 'CLOSED' };
+  if (Number.isFinite(deadline)) return deadline > Date.now()
+    ? { live: true, label: 'LIVE BOUNTY' }
+    : { live: false, label: 'CLOSED' };
+  return accepting === true ? { live: true, label: 'LIVE BOUNTY' } : { live: false, label: 'CLOSED' };
+}
+
+/**
+ * Keep one or more countdown nodes in step with the clock.
+ * @param {Array<{node: HTMLElement, deadline: string|number}>} targets
+ * @returns {() => void} Stop function.
+ */
+function startCountdowns(targets) {
+  const paint = () => {
+    for (const target of targets) target.node.textContent = formatCountdown(target.deadline);
   };
-  const flushLists = () => {
-    if (bullets.length) out.push(`<ul>${bullets.map((line) => `<li>${renderInline(line)}</li>`).join('')}</ul>`);
-    if (numbers.length) out.push(`<ol>${numbers.map((line) => `<li>${renderInline(line)}</li>`).join('')}</ol>`);
-    bullets = [];
-    numbers = [];
+  paint();
+  const timer = window.setInterval(paint, COUNTDOWN_MS);
+  return () => window.clearInterval(timer);
+}
+
+/** A shimmering skeleton for the detail pane. @returns {HTMLElement} */
+export function detailSkeleton() {
+  const panel = el('div', 'panel detail-skeleton');
+  for (let index = 0; index < 5; index += 1) {
+    const block = el('div', 'sk');
+    block.style.height = index === 0 ? '58px' : '34px';
+    block.style.margin = '10px 12px';
+    panel.append(block);
+  }
+  panel.setAttribute('aria-hidden', 'true');
+  return panel;
+}
+
+/**
+ * The header block: the LIVE or CLOSED pill, the title and the first line of
+ * the description.
+ * @param {any} bounty
+ * @returns {HTMLElement}
+ */
+function detailHeader(bounty, level = 1) {
+  const head = el('header', 'detail-head');
+  const state = bountyState(bounty);
+  head.append(el('span', `status-pill ${state.live ? 'status-live' : 'status-closed'}`, state.label));
+  const category = pick(bounty, ['category', 'category_name']);
+  if (category) head.append(el('span', 'tag', String(category)));
+  const holder = el('div');
+  holder.append(head);
+  holder.append(el(level === 1 ? 'h1' : 'h2', 'detail-title', String(pick(bounty, ['title', 'name']) ?? 'Bounty')));
+  const subline = firstLine(pick(bounty, ['summary', 'description', 'tagline']), 190);
+  if (subline) holder.append(el('p', 'detail-subline', subline));
+  return holder;
+}
+
+/**
+ * The four live stat cards plus the pot's fee breakdown.
+ * @param {any} bounty
+ * @param {string} slug
+ * @returns {{node: HTMLElement, countdown: {node: HTMLElement, deadline: string|number}}}
+ */
+function detailStats(bounty, slug) {
+  const pot = pick(bounty, ['potUsd', 'pot', 'live_pot', 'pot_dollars']);
+  const feeTotal = pick(bounty, ['entryFeesUsd', 'entry_fees_total', 'entryFeesTotal', 'fee_total']);
+  const feePayers = pick(bounty, ['entry_fee_payers', 'entryFeePayers', 'fee_payers']);
+  const fee = pick(bounty, ['entryFeeUsd', 'entryFee', 'entry_fee', 'fee']);
+  const deadline = pick(bounty, ['deadline', 'ends_at', 'end']) ?? '';
+  const countdownNode = el('span', 'value', formatCountdown(deadline));
+  const potHint = feeTotal !== undefined
+    ? `${formatMoney(feeTotal)} from ${formatNumber(feePayers ?? 0)} entry fees`
+    : `${formatDollars(pot)} live pot`;
+  const feeHint = toNumber(fee) === null || toNumber(fee) === 0 ? 'Free to enter' : 'Paid entry';
+  const entries = entryCount(bounty);
+  const card = (label, valueNode, hint, accent) => {
+    const cell = el('div', 'stat-card');
+    cell.append(el('span', 'label', label), valueNode, el('span', 'hint', hint));
+    if (accent) valueNode.classList.add('accent');
+    return cell;
   };
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (line.startsWith('```')) {
-      flushParagraph(); flushLists();
-      if (code === null) code = [];
-      else { out.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`); code = null; }
-      continue;
+  const strip = el('div', 'stat-strip');
+  strip.append(
+    card('Live pot', el('span', 'value', formatMoney(pot)), potHint, true),
+    card('Entry fee', el('span', 'value', feeText(bounty)), feeHint, false),
+    card('Time left', countdownNode, deadline ? `Closes ${formatDate(deadline)}` : 'No deadline given', false),
+    card('Entries', el('span', 'value', formatNumber(entries)), 'Submissions in the pot', false),
+  );
+  return { node: strip, countdown: { node: countdownNode, deadline } };
+}
+
+/**
+ * Enter, leaderboard and share, wired to real destinations.
+ * @param {{bounty: any, slug: string, navigate?: (hash: string) => void, ranked?: number, announce?: (message: string) => void}} options
+ * @returns {HTMLElement}
+ */
+function detailActions(options) {
+  const { bounty, slug } = options;
+  const row = el('div', 'action-row');
+  const enter = link(bountyAddress(bounty, slug), 'Enter on make.fun', 'btn btn-primary');
+  const leaderboard = link(
+    `#/bounty/${encodeURIComponent(slug)}/leaderboard`,
+    `Leaderboard${options.ranked ? ` · ${formatNumber(options.ranked)}` : ''}`,
+    'btn btn-secondary',
+  );
+  const share = el('button', 'btn btn-secondary', 'Share');
+  share.type = 'button';
+  const note = el('span', 'copied-note');
+  note.setAttribute('aria-live', 'polite');
+  share.addEventListener('click', async () => {
+    const address = window.location.href;
+    try {
+      await navigator.clipboard.writeText(address);
+      note.textContent = 'Copied';
+    } catch {
+      note.textContent = 'Copy this page address';
     }
-    if (code !== null) { code.push(raw); continue; }
-    if (!line) { flushParagraph(); flushLists(); continue; }
-    const heading = line.match(/^(#{1,4})\s+(.*)$/);
-    if (heading) {
-      flushParagraph(); flushLists();
-      const level = Math.min(3, Math.max(2, heading[1].length));
-      out.push(`<h${level}>${renderInline(escapeHtml(heading[2].replace(/#+$/, '').trim()).replace(/&amp;/g, '&'))}</h${level}>`);
-      continue;
-    }
-    const bullet = line.match(/^[-*+]\s+(.*)$/);
-    if (bullet) { flushParagraph(); if (numbers.length) flushLists(); bullets.push(bullet[1]); continue; }
-    const ordered = line.match(/^\d+[.)]\s+(.*)$/);
-    if (ordered) { flushParagraph(); if (bullets.length) flushLists(); numbers.push(ordered[1]); continue; }
-    if (line.startsWith('>')) { flushParagraph(); flushLists(); out.push(`<blockquote><p>${renderInline(line.replace(/^>\s?/, ''))}</p></blockquote>`); continue; }
-    if (/^[-*_]{3,}$/.test(line)) { flushParagraph(); flushLists(); out.push('<hr />'); continue; }
-    flushLists(); paragraph.push(line);
-  }
-  flushParagraph(); flushLists();
-  if (code !== null) out.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`);
-  return out.join('');
-}
-
-function plainText(source) {
-  return String(source ?? '').replace(/^#{1,6}\s*/gm, '').replace(/^[-*+]\s+/gm, '').replace(/\*\*([^*]+)\*\*/g, '$1').replace(/`([^`]+)`/g, '$1').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/[*_>#]/g, '').replace(/\s+/g, ' ').trim();
-}
-
-function deliverablesOf(item) {
-  const lines = String(pickFirst(item, ['description', 'summary']) ?? '').split('\n');
-  const start = lines.findIndex((line) => /deliverables/i.test(line));
-  if (start === -1) return [];
-  const found = [];
-  for (let index = start + 1; index < lines.length; index += 1) {
-    const line = lines[index].trim();
-    if (/^#{1,4}\s/.test(line)) break;
-    const bullet = line.match(/^[-*+]\s+(.*)$/);
-    if (bullet) found.push(plainText(bullet[1]));
-    else if (found.length && line) break;
-  }
-  return found.filter(Boolean).slice(0, 8);
-}
-
-function criteriaOf(resolution) {
-  return asList(pickFirst(resolution ?? {}, ['criteria', 'judging_criteria', 'rubric'])).map((entry) => {
-    if (typeof entry === 'string') return entry;
-    const label = pickFirst(entry, ['title', 'name', 'label', 'criterion']);
-    const weight = pickFirst(entry, ['weight', 'share', 'percent']);
-    return weight ? `${label} (${weight})` : String(label ?? '');
-  }).filter(Boolean);
-}
-
-const statCard = (name, label, value, note) => `<div class="stat-card"><div class="stat-icon">${icon(name)}</div>
-  <div class="stat-body"><span class="stat-label">${label}</span><span class="stat-value">${escapeHtml(value)}</span><span class="stat-note">${escapeHtml(note)}</span></div></div>`;
-
-function statMarkup(item, now) {
-  const fee = feeOf(item);
-  const feeTotal = feeTotalOf(item);
-  return statCard('pot', 'Live pot', formatMoney(potOf(item)), feeTotal !== null && feeTotal > 0 ? `Includes ${formatMoney(feeTotal)} in entry fees` : 'Base rewards, before fees')
-    + statCard('fee', 'Entry fee', fee !== null ? formatMoney(fee) : 'Free', fee !== null ? 'Per paid entry' : 'Free to enter')
-    + statCard('clock', 'Time left', formatTimeLeft(toIso(deadlineOf(item)), now), `Closes ${formatDate(toIso(deadlineOf(item)))}`)
-    + statCard('entry', 'Entries', formatNumber(entriesOf(item)), 'Submissions received');
-}
-
-function rewardsMarkup(item) {
-  const rewards = rewardsOf(item).slice(0, 20);
-  if (!rewards.length) return '<p class="card-note">The API has not published a rewards breakdown for this bounty.</p>';
-  const base = toFiniteNumber(item?.rewardAmount) ?? 0;
-  const fees = feeTotalOf(item);
-  const math = fees !== null ? `${formatMoney(base)} base + ${formatMoney(fees)} entry fees = ${formatMoney(potOf(item))} live pot` : `Live pot ${formatMoney(potOf(item))}, split across ${formatNumber(rewards.length)} paid places`;
-  const max = Math.max(...rewards.map((row) => row.amount ?? 0), 1);
-  const rows = rewards.map((row) => `<tr${row.place > 10 ? ' data-extra hidden' : ''}><td class="num">${formatNumber(row.place)}</td>
-    <td class="num">${formatMoney(row.base)}</td><td class="num">${formatMoney(row.share)}</td><td class="num"><strong>${formatMoney(row.amount)}</strong></td>
-    <td><span class="reward-bar" aria-hidden="true"><span class="base" style="width:${(((row.base ?? 0) / max) * 100).toFixed(1)}%"></span><span class="share" style="width:${(((row.share ?? 0) / max) * 100).toFixed(1)}%"></span></span></td></tr>`).join('');
-  const toggle = rewards.some((row) => row.place > 10) ? '<button type="button" class="button button-secondary button-small" data-show-all>Show all 20 places</button>' : '';
-  return `<p class="card-note">${escapeHtml(math)}</p><div class="table-wrap"><table class="data-table reward-table">
-    <thead><tr><th class="num">Place</th><th class="num">Base</th><th class="num">Fee share</th><th class="num">Pays now</th><th>Share</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>${toggle}`;
-}
-
-function timelineMarkup(item, now) {
-  const phases = asList(pickFirst(item, ['phases', 'windows']));
-  const rows = phases.length ? phases.map((phase) => {
-    const start = parseTimestamp(pickFirst(phase, ['start', 'starts_at', 'from']));
-    const end = parseTimestamp(pickFirst(phase, ['end', 'ends_at', 'to']));
-    return { title: String(pickFirst(phase, ['title', 'name', 'key']) ?? 'Phase'), start, end, live: start !== null && end !== null && start <= now && now < end };
-  }) : [
-    { title: 'Development window', start: publishOf(item), end: deadlineOf(item), live: isOpen(item, now) },
-    { title: 'Results', start: deadlineOf(item), end: resultsOf(item), live: false },
-  ];
-  const markup = rows.map((row) => `<div class="phase${row.live ? ' phase-live' : ''}"><span class="phase-dot" aria-hidden="true"></span>
-    <span class="phase-title">${escapeHtml(row.title)}</span><span class="phase-date">${escapeHtml(formatDate(toIso(row.start)))} – ${escapeHtml(formatDate(toIso(row.end)))}</span></div>`).join('');
-  const scores = pickFirst(item, ['scores_visible', 'scoresVisible']);
-  const note = typeof scores === 'boolean' && !scores ? 'Scores are held until the final run.' : 'Live scores update as judging proceeds.';
-  return `<div class="timeline">${markup}</div><p class="card-note">${note}</p>`;
-}
-
-function judgingMarkup(item) {
-  const resolution = pickFirst(item, ['resolution', 'judging']) ?? {};
-  const summary = pickFirst(resolution, ['summary', 'description', 'text']);
-  const criteria = criteriaOf(resolution);
-  const metric = pickFirst(resolution, ['metric_name', 'metricName']) ?? pickFirst(item, ['metric_name', 'metric']);
-  const unit = pickFirst(resolution, ['metric_unit', 'metricUnit']) ?? pickFirst(item, ['metric_unit', 'unit']);
-  const metricLine = metric ? `<p class="card-note">Metric: <strong>${escapeHtml(String(metric))}</strong>${unit ? ` · ${escapeHtml(String(unit))}` : ''}</p>` : '';
-  const checklist = criteria.length ? `<ul class="checklist">${criteria.map((entry) => `<li>${escapeHtml(String(entry))}</li>`).join('')}</ul>` : '';
-  return `${summary ? `<div class="prose">${renderMarkdown(summary)}</div>` : ''}${metricLine}${checklist}`;
-}
-
-function topFiveMarkup(item) {
-  const rows = standingsOf(item)
-    .filter((row) => toFiniteNumber(pickFirst(row, ['rank', 'place', 'position'])) !== null)
-    .sort((left, right) => toFiniteNumber(pickFirst(left, ['rank', 'place'])) - toFiniteNumber(pickFirst(right, ['rank', 'place'])))
-    .slice(0, 5);
-  if (!rows.length) return '<p class="card-note">No standings have been published yet.</p>';
-  return `<div class="entry-list">${rows.map((row) => {
-    const handle = handleOf(row);
-    const rank = toFiniteNumber(pickFirst(row, ['rank', 'place', 'position']));
-    const title = String(pickFirst(row, ['title', 'entry_title']) ?? 'Entry');
-    return `<div class="entry-row"><span class="entry-rank">${formatNumber(rank)}</span><div class="entry-body">
-      ${handle ? `<a class="entry-handle" href="#/user/${encodeURIComponent(handle)}">@${escapeHtml(handle)}</a>` : '<span class="entry-handle">Anonymous</span>'}
-      <span class="entry-title">${escapeHtml(title)}</span></div><span class="entry-score">${escapeHtml(scoreText(row, judgeMetricOf(item)))}</span></div>`;
-  }).join('')}</div>`;
-}
-
-function activityMarkup(item) {
-  const rows = standingsOf(item).map((row) => ({ row, at: parseTimestamp(pickFirst(row, ['received_at', 'received', 'created_at', 'entered_at', 'date'])) }))
-    .filter((entry) => entry.at !== null).sort((left, right) => right.at - left.at).slice(0, 5);
-  if (!rows.length) return '<p class="card-note">No recent entry timestamps are available yet.</p>';
-  return `<div class="entry-list">${rows.map(({ row, at }) => {
-    const handle = handleOf(row);
-    return `<div class="entry-row"><span class="entry-rank" aria-hidden="true">•</span><div class="entry-body">
-      ${handle ? `<a class="entry-handle" href="#/user/${encodeURIComponent(handle)}">@${escapeHtml(handle)}</a>` : '<span class="entry-handle">Anonymous</span>'}
-      <span class="entry-title">${escapeHtml(String(pickFirst(row, ['title', 'entry_title']) ?? 'Entered this bounty'))}</span></div>
-      <span class="entry-score muted">${escapeHtml(formatRelativeTime(toIso(at), Date.now()))}</span></div>`;
-  }).join('')}</div>`;
-}
-
-function winnerMarkup(item) {
-  const winner = pickFirst(item, ['winner']);
-  if (!winner || typeof winner !== 'object') return '';
-  const handle = handleOf(winner);
-  const title = pickFirst(winner, ['title', 'entry_title']);
-  const place = toFiniteNumber(pickFirst(winner, ['placement', 'place', 'rank']));
-  const amount = parseAmount(pickFirst(winner, ['amountUsd', 'amount']));
-  return `<section class="card winner-card"><div class="card-head"><h2>Winner</h2>${place ? `<span class="status-pill status-soon">Place ${formatNumber(place)}</span>` : ''}</div>
-    <p class="reward-big">${formatMoney(amount)}</p>${title ? `<p class="reward-meta">${escapeHtml(String(title))}</p>` : ''}
-    ${handle ? `<p class="reward-meta">by <a href="#/user/${encodeURIComponent(handle)}">@${escapeHtml(handle)}</a></p>` : ''}
-    <p class="button-row"><a class="button button-secondary button-small" href="#/bounty/${encodeURIComponent(slugOf(item))}/leaderboard">Final results</a></p></section>`;
-}
-
-function headerMarkup(item, open) {
-  const summary = String(pickFirst(item, ['summary', 'subtitle']) ?? plainText(pickFirst(item, ['description']))).split('\n')[0];
-  return `<section class="bounty-head"><div>${open ? '<span class="status-pill status-live">Live bounty</span>' : '<span class="status-pill status-closed">Closed</span>'}
-    <h1>${escapeHtml(titleOf(item))}</h1><p class="subline">${escapeHtml(summary)}</p></div>
-    <div class="bounty-head-art" aria-hidden="true"><svg viewBox="0 0 36 36" width="28" height="28" focusable="false"><path d="M13 9l-3 3 3 3M19 9l3 3-3 3M16.5 6l-2 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div></section>`;
-}
-
-function sidebarMarkup(item, now) {
-  const status = isOpen(item, now) ? '<span class="live-dot">Live now</span>' : '<span class="status-pill status-closed">Closed</span>';
-  const fee = feeOf(item);
-  return `<div class="card"><div class="card-head"><h2>Rewards</h2>${status}</div>
-    <p class="reward-big">${formatMoney(potOf(item))}</p>
-    <p class="reward-meta">${formatNumber(entriesOf(item))} entries · ${fee !== null ? formatMoney(fee) : 'Free'} fee</p>
-    <dl class="meta-list"><div><dt>Opens</dt><dd>${escapeHtml(formatDateTime(toIso(publishOf(item))))}</dd></div>
-    <div><dt>Closes</dt><dd>${escapeHtml(formatDateTime(toIso(deadlineOf(item))))}</dd></div>
-    <div><dt>Results by</dt><dd>${escapeHtml(formatDateTime(toIso(resultsOf(item))))}</dd></div></dl></div>
-    <div class="card"><div class="card-head"><h2>Timeline</h2></div>${timelineMarkup(item, now)}</div>`;
-}
-
-function actionsMarkup(item) {
-  const address = pickFirst(item, ['page_url', 'pageUrl', 'page', 'url', 'href']) ?? 'https://make.fun/';
-  const kit = pickFirst(item, ['kit_tarball', 'kitTarball', 'kit_url', 'kit']);
-  return `<a class="button button-primary" href="${escapeHtml(String(address))}" rel="noopener">Enter Bounty</a>
-    <a class="button button-secondary" href="#/bounty/${encodeURIComponent(slugOf(item))}/leaderboard">View Leaderboard</a>
-    <button type="button" class="button button-secondary" data-share>Share</button>
-    ${kit ? `<a class="button button-ghost" href="${escapeHtml(String(kit))}" rel="noopener">Download kit</a>` : ''}`;
-}
-
-export async function renderBounty(root, context) {
-  const slug = context.route.slug;
-  context.setTitle('Bounty');
-  root.innerHTML = '<p class="loading-line">Loading the bounty…</p>';
-  const result = await fetchBounty(slug);
-  if (!context.isActive()) return;
-  if (!result.data) {
-    const missing = result.error?.status === 404;
-    root.innerHTML = `<div class="empty-state"><h2>${missing ? 'Bounty not found' : 'Bounty could not load'}</h2>
-      <p>${missing ? 'No bounty exists at this address.' : 'The make.fun API did not answer just now. Try again shortly.'}</p>
-      <p><a class="button button-primary" href="#/">Back to the board</a></p></div>`;
-    return;
-  }
-
-  const item = result.data.competition ?? result.data;
-  context.setTitle(titleOf(item));
-  const now = Date.now();
-  const notices = asList(pickFirst(item, ['notices'])).map(String);
-  root.innerHTML = `${headerMarkup(item, isOpen(item, now))}
-    ${notices.length ? `<div class="notice">${notices.map(escapeHtml).join(' ')}</div>` : ''}
-    <div class="stat-row" data-stats>${statMarkup(item, now)}</div>
-    <div class="button-row bounty-actions">${actionsMarkup(item)}</div>
-    <div class="layout-split"><div class="main-column">
-      <div class="tabs" role="tablist" aria-label="Bounty sections">${TABS.map(([key, label], index) => `<button type="button" class="tab" role="tab" id="tab-${key}" aria-controls="panel-${key}" aria-selected="${index === 0}" data-tab="${key}">${label}</button>`).join('')}</div>
-      <div class="tab-panel" role="tabpanel" id="panel-overview" aria-labelledby="tab-overview" data-panel="overview">
-        <section class="card"><div class="card-head"><h2>About this bounty</h2></div>${pickFirst(item, ['description', 'summary']) ? `<div class="prose">${renderMarkdown(pickFirst(item, ['description', 'summary']))}</div>` : '<p class="card-note">No description was published.</p>'}
-          ${deliverablesOf(item).length ? `<h2>Deliverables</h2><ul class="checklist">${deliverablesOf(item).map((entry) => `<li>${escapeHtml(entry)}</li>`).join('')}</ul>` : ''}</section>
-        <section class="card"><div class="card-head"><h2>Rewards</h2><span class="card-note">${formatMoney(potOf(item))} live pot</span></div><div data-rewards>${rewardsMarkup(item)}</div></section>
-        <section class="card"><div class="card-head"><h2>How it is judged</h2></div>${judgingMarkup(item)}</section></div>
-      <div class="tab-panel" role="tabpanel" id="panel-leaderboard" aria-labelledby="tab-leaderboard" data-panel="leaderboard" hidden>
-        <section class="card"><div class="card-head"><h2>Top 5 entries</h2><a href="#/bounty/${encodeURIComponent(slug)}/leaderboard">Full leaderboard</a></div>${topFiveMarkup(item)}</section>
-        <section class="card"><div class="card-head"><h2>Standings</h2></div><p class="card-note">The full ranked table lives on its own page.</p>
-          <a class="button button-primary" href="#/bounty/${encodeURIComponent(slug)}/leaderboard">Open the leaderboard</a></section></div>
-      <div class="tab-panel" role="tabpanel" id="panel-rules" aria-labelledby="tab-rules" data-panel="rules" hidden>
-        <section class="card"><div class="card-head"><h2>Rules</h2></div><details class="details"><summary>Read the full rules</summary>
-          <div class="details-body prose">${pickFirst(item, ['rules']) ? renderMarkdown(pickFirst(item, ['rules'])) : '<p>No rules text was published for this bounty.</p>'}</div></details></section></div>
-      <div class="tab-panel" role="tabpanel" id="panel-rewards" aria-labelledby="tab-rewards" data-panel="rewards" hidden>
-        <section class="card"><div class="card-head"><h2>Rewards</h2></div>${rewardsMarkup(item)}</section></div>
-      <div class="tab-panel" role="tabpanel" id="panel-activity" aria-labelledby="tab-activity" data-panel="activity" hidden>
-        <section class="card"><div class="card-head"><h2>Recent entries</h2></div>${activityMarkup(item)}</section></div>
-    </div><aside class="side-column">${sidebarMarkup(item, now)}</aside></div>${winnerMarkup(item)}`;
-
-  const stats = root.querySelector('[data-stats]');
-  const countdown = window.setInterval(() => {
-    if (context.isActive()) stats.innerHTML = statMarkup(item, Date.now());
-  }, SECOND);
-  const tabs = [...root.querySelectorAll('[data-tab]')];
-  const panels = [...root.querySelectorAll('[data-panel]')];
-  root.addEventListener('click', (event) => {
-    const tab = event.target.closest('[data-tab]');
-    if (tab) {
-      for (const button of tabs) button.setAttribute('aria-selected', String(button.dataset.tab === tab.dataset.tab));
-      for (const panel of panels) panel.hidden = panel.dataset.panel !== tab.dataset.tab;
-    }
-    const showAll = event.target.closest('[data-show-all]');
-    if (showAll) {
-      for (const row of root.querySelectorAll('tr[data-extra]')) row.hidden = false;
-      showAll.hidden = true;
-    }
-    const share = event.target.closest('[data-share]');
-    if (share) {
-      const done = () => {
-        share.textContent = 'Copied';
-        window.setTimeout(() => { share.textContent = 'Share'; }, 1500);
-      };
-      navigator.clipboard?.writeText(location.href).then(done, done);
-    }
+    window.setTimeout(() => { note.textContent = ''; }, 2_400);
+    options.announce?.('Page address copied.');
   });
-  context.signal.addEventListener('abort', () => window.clearInterval(countdown), { once: true });
+  row.append(enter, leaderboard, share, note);
+  return row;
+}
+
+/**
+ * The top-five standings preview, from the live competition snapshot.
+ * @param {{standings: any[], metric: any, slug: string}} options
+ * @returns {HTMLElement}
+ */
+function previewBlock(options) {
+  const rows = Array.isArray(options.standings) ? options.standings.slice(0, DEFAULTS.previewRows) : [];
+  const holder = el('div');
+  if (rows.length === 0) {
+    holder.append(emptyNote('No standings yet. The first scored entries will appear here.'));
+  } else {
+    for (const row of rows) {
+      const line = el('div', 'preview-row');
+      line.append(el('span', 'preview-rank num-cell', `#${formatNumber(pick(row, ['rank']) ?? DASH)}`));
+      const middle = el('div');
+      const handle = String(pick(row, ['handle', 'username', 'name']) ?? 'builder');
+      middle.append(link(`#/user/${encodeURIComponent(handle)}`, handle, 'preview-handle'));
+      const title = pick(row, ['title', 'submission_title', 'entry_title']);
+      if (title) middle.append(el('span', 'preview-title', String(title)));
+      line.append(middle);
+      const values = pick(row, ['values']);
+      const score = values && typeof values === 'object' && options.metric?.key
+        && values[options.metric.key] !== undefined
+        ? values[options.metric.key]
+        : pick(row, ['value', 'score']);
+      line.append(el('span', 'preview-score', formatScore(score, options.metric)));
+      holder.append(line);
+    }
+  }
+  return sectionBlock('Top 5 entries', holder, '', 'block preview-block');
+}
+
+/**
+ * The three dated phases of the bounty, marking the one the clock sits in.
+ * @param {any} bounty
+ * @returns {HTMLElement}
+ */
+function timelineBlock(bounty) {
+  const timeline = el('div', 'timeline');
+  const declared = pick(bounty, ['phases']);
+  const phases = Array.isArray(declared) && declared.length > 0
+    ? declared.map((phase) => ({
+      name: String(pick(phase, ['title', 'key', 'name']) ?? 'Phase'),
+      moment: pick(phase, ['start', 'starts_at']),
+      end: pick(phase, ['end', 'ends_at']),
+      scores: pick(phase, ['scores_visible', 'scores']),
+    }))
+    : [
+      { name: 'Opened', moment: pick(bounty, ['published', 'published_at', 'publish_date', 'starts_at', 'start']) },
+      { name: 'Deadline', moment: pick(bounty, ['deadline', 'ends_at', 'end']) },
+      { name: 'Results by', moment: pick(bounty, ['results_at', 'results_by', 'resolved_at']) },
+    ];
+  const now = Date.now();
+  for (const phase of phases) {
+    const cell = el('div', 'phase');
+    const start = Date.parse(phase.moment ?? '');
+    const end = Date.parse(phase.end ?? '');
+    const current = Number.isFinite(start) && Number.isFinite(end)
+      ? now >= start && now < end
+      : Number.isFinite(start) && Math.abs(start - now) < 86_400_000;
+    if (current) cell.classList.add('is-now');
+    cell.append(el('span', 'phase-name', phase.name));
+    cell.append(el('span', 'phase-date', phase.moment ? formatDate(phase.moment) : DASH));
+    if (phase.scores === false) cell.append(el('span', 'phase-date', 'Scores held'));
+    timeline.append(cell);
+  }
+  return timeline;
+}
+
+/**
+ * The rewards block shared by the pane and the page.
+ * @param {any} bounty
+ * @param {number} [limit]
+ * @returns {HTMLElement}
+ */
+function rewardsBlock(bounty, limit = DEFAULTS.visibleRewardPlaces) {
+  const rewards = rewardsNow(bounty);
+  const baseTotal = rewards.reduce((total, row) => total + (toNumber(row.base) ?? 0), 0);
+  const feeTotal = rewards.reduce((total, row) => total + (toNumber(row.fee_share) ?? 0), 0);
+  const node = rewardsTable({
+    rewardsNow: rewards,
+    pot: pick(bounty, ['potUsd', 'pot', 'live_pot', 'pot_dollars']),
+    visibleLimit: limit,
+    showAllLabel: `Show all ${formatNumber(rewards.length)} places`,
+  });
+  return sectionBlock(
+    'Rewards',
+    node,
+    rewardsMathLine({
+      pot: pick(bounty, ['potUsd', 'pot', 'live_pot', 'pot_dollars']),
+      baseTotal: rewards.length ? baseTotal : null,
+      feeTotal: rewards.length ? feeTotal : null,
+    }),
+    'block rewards-block',
+  );
+}
+
+/**
+ * The compact detail pane used by the board's split view. It renders only
+ * into the mount it is given, so selecting another row never touches the
+ * table.
+ * @param {{mount: HTMLElement, slug: string, navigate?: (hash: string) => void, announce?: (message: string) => void, onData?: (payload: {bounty: any, standings: any[]}) => void}} options
+ * @returns {Promise<() => void>} Cleanup for the countdown timers.
+ */
+export async function renderDetailPane(options) {
+  const { mount, slug } = options;
+  mount.replaceChildren(detailSkeleton());
+  const [bountyResult, liveResult] = await Promise.all([
+    getBounty(slug),
+    getLeadersStrip(slug).catch(() => ({ data: null })),
+  ]);
+  const bounty = bountyResult.data ?? {};
+  const live = liveResult?.data ?? {};
+  const standings = liveStandings(live);
+  const metric = describeScoreColumn(pick(bounty, ['leaderboard', 'leaderboard_info']));
+  const ranked = pick(bounty, ['ranked_count', 'entries_ranked']) ?? (Array.isArray(standings) ? standings.length : 0);
+  options.onData?.({ bounty, standings: Array.isArray(standings) ? standings : [] });
+
+  const panel = el('div', 'panel');
+  panel.append(detailHeader(bounty, 2));
+  const body = el('div', 'detail-body');
+  const stats = detailStats(bounty);
+  body.append(stats.node);
+  body.append(detailActions({ bounty, slug, navigate: options.navigate, ranked, announce: options.announce }));
+  body.append(rewardsBlock(bounty, DEFAULTS.paneRewardPlaces));
+  body.append(previewBlock({ standings, metric, slug }));
+  body.append(sectionBlock('Dates', timelineBlock(bounty), '', 'block'));
+  panel.append(body);
+  mount.replaceChildren(panel);
+
+  const stop = startCountdowns([stats.countdown]);
+  return stop;
+}
+
+/**
+ * Pull the first list of bullet points that follows a "Deliverables" heading.
+ * @param {string|null|undefined} markdown
+ * @returns {string[]}
+ */
+function deliverablesFrom(markdown) {
+  const lines = String(markdown ?? '').split(/\r?\n/);
+  const found = [];
+  let collecting = false;
+  for (const line of lines) {
+    if (/^#{2,4}\s+deliverables?/i.test(line.trim())) {
+      collecting = true;
+      continue;
+    }
+    if (!collecting) continue;
+    if (/^#{2,4}\s+/.test(line.trim())) break;
+    const bullet = /^\s*[-*+]\s+(.+)$/.exec(line);
+    if (bullet) found.push(bullet[1].replace(/[`*]/g, '').trim());
+    else if (found.length > 0 && line.trim() === '') break;
+  }
+  return found.slice(0, 8);
+}
+
+/**
+ * The judging card: the resolution summary, criteria and metric.
+ * @param {any} bounty
+ * @returns {HTMLElement}
+ */
+function judgingBlock(bounty) {
+  const resolution = pick(bounty, ['resolution', 'judging']) ?? {};
+  const metric = pick(resolution, ['metric']) ?? {};
+  const criteria = pick(resolution, ['criteria', 'criteria_list']);
+  const grid = el('div', 'judge-grid');
+  const summary = pick(resolution, ['summary', 'description']);
+  const wrapper = el('div');
+  if (summary) {
+    const card = el('div', 'judge-card');
+    card.append(el('b', '', 'How entries are read'), document.createTextNode(String(summary)));
+    grid.append(card);
+  }
+  const metricName = pick(metric, ['name', 'title', 'key']);
+  const metricUnit = pick(metric, ['unit']);
+  if (metricName) {
+    const card = el('div', 'judge-card');
+    card.append(el('b', '', 'Metric'), document.createTextNode(
+      `${metricName}${metricUnit ? ` · ${metricUnit}` : ''}`,
+    ));
+    grid.append(card);
+  }
+  if (Array.isArray(criteria) && criteria.length > 0) {
+    const list = el('ul', 'checklist');
+    for (const item of criteria.slice(0, 10)) {
+      list.append(el('li', '', typeof item === 'string' ? item : String(pick(item, ['title', 'name', 'label']) ?? '')));
+    }
+    const card = el('div', 'judge-card');
+    card.append(el('b', '', 'Criteria'), list);
+    grid.append(card);
+  }
+  if (!summary && !metricName && (!Array.isArray(criteria) || criteria.length === 0)) {
+    wrapper.append(emptyNote('The judging plan has not been published for this bounty yet.'));
+  } else {
+    wrapper.append(grid);
+  }
+  return sectionBlock('How it is judged', wrapper, '', 'block judging');
+}
+
+/**
+ * The resolved winner card, shown only when the reply names a winner.
+ * @param {any} bounty
+ * @param {string} slug
+ * @returns {HTMLElement|null}
+ */
+function winnerBlock(bounty, slug) {
+  const winner = pick(bounty, ['winner']);
+  if (!winner) return null;
+  const card = el('div', 'winner-card');
+  const place = pick(winner, ['place', 'placement', 'rank']);
+  card.append(el('span', 'winner-place', place ? `#${formatNumber(place)}` : 'Winner'));
+  const detail = el('div');
+  const handle = pick(winner, ['handle', 'username']);
+  if (handle) detail.append(link(`#/user/${encodeURIComponent(handle)}`, String(handle), 'preview-handle'));
+  const title = pick(winner, ['title', 'submission_title']);
+  if (title) detail.append(el('span', 'preview-title', String(title)));
+  card.append(detail);
+  const amount = pick(winner, ['prize', 'amount', 'prize_dollars']);
+  if (amount !== undefined) card.append(el('span', 'preview-score', formatMoney(amount)));
+  card.append(link(`#/bounty/${encodeURIComponent(slug)}/leaderboard`, 'Final results →', 'btn btn-secondary'));
+  return sectionBlock('Winner', card, '', 'block');
+}
+
+/**
+ * The in-page tab set. Every tab is a real button that toggles a panel and
+ * never changes the route.
+ * @param {Array<{label: string, content: Node}>} tabs
+ * @returns {HTMLElement}
+ */
+function tabbedSections(tabs) {
+  const wrapper = el('div', 'tab-wrap');
+  const bar = el('div', 'tabs');
+  bar.setAttribute('role', 'tablist');
+  const panels = el('div');
+  tabs.forEach((tab, index) => {
+    const button = el('button', `tab${index === 0 ? ' is-active' : ''}`, tab.label);
+    button.type = 'button';
+    button.setAttribute('role', 'tab');
+    button.id = `bounty-tab-${index}`;
+    button.setAttribute('aria-controls', `bounty-panel-${index}`);
+    button.setAttribute('aria-selected', index === 0 ? 'true' : 'false');
+    const panel = el('section', 'tab-panel');
+    panel.id = `bounty-panel-${index}`;
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', button.id);
+    panel.hidden = index !== 0;
+    panel.append(tab.content);
+    button.addEventListener('click', () => {
+      for (const other of bar.querySelectorAll('.tab')) {
+        const active = other === button;
+        other.classList.toggle('is-active', active);
+        other.setAttribute('aria-selected', active ? 'true' : 'false');
+      }
+      for (const other of panels.querySelectorAll('.tab-panel')) other.hidden = other !== panel;
+      button.focus();
+    });
+    bar.append(button);
+    panels.append(panel);
+  });
+  wrapper.append(bar, panels);
+  return wrapper;
+}
+
+/**
+ * The full bounty page. It shares the pane's header, stats, rewards and top-5
+ * preview, then adds tabs, judging, the kit link, the rules and a winner card.
+ * @param {import('../main.js').ViewContext} context
+ * @returns {Promise<() => void>}
+ */
+export async function renderBounty(context) {
+  const slug = context.route.slug;
+  const root = context.root;
+  root.replaceChildren(detailSkeleton());
+  const { bounty, leaderboard, stale } = await getBountyWithLeaderboard(slug);
+  const liveMetric = describeScoreColumn(pick(bounty, ['leaderboard', 'leaderboard_info']));
+  const entries = pick(leaderboard, ['entries', 'rows']) ?? [];
+  const standings = entries.slice(0, DEFAULTS.previewRows);
+  const title = String(pick(bounty, ['title', 'name']) ?? 'Bounty');
+  context.setTitle(title);
+  document.title = `make.fun — ${title}`;
+  if (stale) window.dispatchEvent(new CustomEvent('potscope:stale'));
+
+  const page = el('article', 'full-bounty');
+  page.append(detailHeader(bounty));
+  const body = el('div', 'detail-body');
+  const stats = detailStats(bounty);
+  body.append(stats.node);
+  body.append(detailActions({ bounty, slug, navigate: context.navigate, announce: context.announce, ranked: pick(leaderboard, ['total', 'count']) }));
+
+  const about = el('div', 'prose');
+  about.innerHTML = renderMarkdown(pick(bounty, ['description'])) || '<p>No description published.</p>';
+  const deliverables = deliverablesFrom(pick(bounty, ['description']));
+  const checklist = el('ul', 'checklist');
+  for (const item of deliverables) checklist.append(el('li', '', item));
+  const overview = el('div');
+  overview.append(sectionBlock('About', about, '', 'block'));
+  if (deliverables.length > 0) overview.append(sectionBlock('Deliverables', checklist, '', 'block'));
+  overview.append(rewardsBlock(bounty));
+
+  const rulesText = pick(bounty, ['rules']);
+  const rulesTab = el('div');
+  const rulesProse = el('div', 'prose');
+  rulesProse.innerHTML = rulesText ? renderMarkdown(rulesText) : '<p>No rules published.</p>';
+  rulesTab.append(rulesProse);
+
+  const activity = el('div');
+  const newest = [...entries].slice(0, DEFAULTS.activityRows);
+  if (newest.length === 0) activity.append(emptyNote('No entries recorded yet.'));
+  for (const row of newest) {
+    const line = el('div', 'preview-row');
+    line.append(el('span', 'preview-rank num-cell', `#${formatNumber(pick(row, ['rank']) ?? DASH)}`));
+    const middle = el('div');
+    const handle = String(pick(row, ['handle', 'username']) ?? 'builder');
+    middle.append(link(`#/user/${encodeURIComponent(handle)}`, handle, 'preview-handle'));
+    middle.append(el('span', 'preview-title', formatDateTime(pick(row, ['received', 'received_at', 'created_at']))));
+    line.append(middle);
+    const activityMetric = describeScoreColumn(leaderboard);
+    const activityValues = pick(row, ['values']);
+    const activityScore = activityValues && typeof activityValues === 'object'
+      && activityValues[activityMetric.key] !== undefined
+      ? activityValues[activityMetric.key]
+      : pick(row, ['value', 'score']);
+    line.append(el('span', 'preview-score', formatScore(activityScore, activityMetric)));
+    activity.append(line);
+  }
+
+  body.append(tabbedSections([
+    { label: 'Overview', content: overview },
+    { label: 'Rules', content: rulesTab },
+    { label: 'Rewards', content: rewardsBlock(bounty) },
+    { label: 'Activity', content: activity },
+  ]));
+
+  body.append(judgingBlock(bounty));
+  const details = el('details', 'rules-details');
+  details.append(el('summary', '', 'Full rules text'));
+  const rulesBody = el('div', 'prose');
+  rulesBody.innerHTML = rulesText ? renderMarkdown(rulesText) : '<p>No rules published.</p>';
+  details.append(rulesBody);
+  body.append(details);
+  const kit = pick(bounty, ['kit_tarball', 'kit', 'kit_url']);
+  if (typeof kit === 'string' && kit && !kit.startsWith('{')) {
+    const kitRow = el('div', 'action-row');
+    kitRow.append(link(kit.startsWith('http') ? kit : `${MAKEFUN_ORIGIN}${kit}`, DEFAULTS.kitLabel, 'btn btn-secondary'));
+    body.append(sectionBlock('Build kit', kitRow, '', 'block'));
+  }
+  const winner = winnerBlock(bounty, slug);
+  if (winner) body.append(winner);
+  body.append(previewBlock({ standings, metric: liveMetric, slug }));
+  body.append(link(`#/bounty/${encodeURIComponent(slug)}/leaderboard`, 'Full leaderboard →', 'btn btn-secondary'));
+
+  page.append(body);
+  root.replaceChildren(page);
+  const stop = startCountdowns([stats.countdown]);
+  context.markReady();
+  return stop;
 }

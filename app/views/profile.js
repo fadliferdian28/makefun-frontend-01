@@ -1,237 +1,434 @@
-// Lazy profile view: the public record of one handle, its five stat boxes,
-// links, recent activity, entries, payouts, and a friendly missing state.
+/**
+ * A builder's public profile: the identity card with five record boxes, the
+ * links row, recent activity, the entries table and the payouts panel.
+ *
+ * The router imports this module lazily. Everything it prints comes from one
+ * profile reply; whatever the reply omits stays a dash.
+ *
+ * @module views/profile
+ */
 
-import { API_ORIGIN } from '../api.js';
-import { loadProfile, readProfileCard } from '../api-detail.js';
-import { formatDate, formatMoney, formatNumber, formatRelativeTime } from '../format.js';
-import { formatPlacement, formatPrize, formatSolutionScore, shortenAddress } from '../format-detail.js';
-import { asList, escapeHtml, pickFirst, toFiniteNumber } from './common.js';
+import { MAKEFUN_ORIGIN } from '../api.js';
+import { getBuilderProfile } from '../api-detail.js';
+import {
+  firstLine,
+  formatDate,
+  formatDateTime,
+  formatMoney,
+  formatNumber,
+  formatScore,
+  toNumber,
+} from '../format.js';
+import { formatPlacement } from '../format-detail.js';
+import { el, emptyNote, link, sectionBlock } from './common.js';
 
-const MISSING = '—';
-const RECENT_LIMIT = 5;
+const DASH = '—';
+const ACTIVITY_LIMIT = 5;
+const DASH_LABELS = {
+  entered: 'Entered',
+  placed: 'Placed',
+  won: 'Won',
+  best: 'Best Place',
+  rewards: 'Total Rewards',
+};
 
-function safeImageUrl(value) {
-  const source = value && typeof value === 'object' ? (value.url ?? value.url_small ?? '') : value;
-  const text = String(source ?? '').trim();
-  if (!text) return '';
-  if (text.startsWith('/')) return `${API_ORIGIN}${text}`;
-  return /^https?:\/\//i.test(text) ? text : '';
-}
-
-function asAddress(value) {
-  const text = String(value ?? '').trim();
-  return /^https?:\/\//i.test(text) ? text : '';
-}
-
-function profileLink(card, pageUrl) {
-  const direct = asAddress(pageUrl);
-  if (direct) return direct;
-  return card.handle ? `${API_ORIGIN}/@${encodeURIComponent(card.handle)}` : API_ORIGIN;
-}
-
-function verifiedMarkup(profilePayload) {
-  return pickFirst(profilePayload ?? {}, ['verified', 'is_verified', 'isVerified']) === true
-    ? '<span class="verified" aria-label="Verified account">✓</span>'
-    : '';
-}
-
-function statBox(label, value) {
-  return `<div class="stat-box"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`;
-}
-
-function statBoxes(record) {
-  const dash = (value) => (value === null || value === undefined ? MISSING : value);
-  return `<div class="stat-boxes">
-    ${statBox('Entered', formatNumber(dash(record.entered)))}
-    ${statBox('Placed', formatNumber(dash(record.placed)))}
-    ${statBox('Won', formatNumber(dash(record.won)))}
-    ${statBox('Best Place', record.best === null || record.best < 1 ? MISSING : `#${formatNumber(record.best)}`)}
-    ${statBox('Total Rewards', formatMoney(record.rewards))}</div>`;
-}
-
-function linkMarkup(card) {
-  const links = [];
-  const githubLogin = card.github && typeof card.github === 'object'
-    ? pickFirst(card.github, ['login', 'handle', 'name'])
-    : card.github;
-  if (githubLogin) {
-    const login = String(githubLogin);
-    links.push(`<a href="https://github.com/${encodeURIComponent(login)}" rel="noopener">GitHub</a>`);
+/**
+ * First defined value among possible API spellings.
+ * @param {Record<string, any>|null|undefined} source
+ * @param {string[]} keys
+ * @returns {any}
+ */
+function pick(source, keys) {
+  if (!source) return undefined;
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) return source[key];
   }
-  const discord = asAddress(card.discord && typeof card.discord === 'object' ? card.discord.url : card.discord);
-  if (discord) links.push(`<a href="${escapeHtml(discord)}" rel="noopener">Discord</a>`);
-  if (card.x) {
-    const handle = String(card.x).replace(/^@/, '');
-    links.push(`<a href="https://x.com/${encodeURIComponent(handle)}" rel="noopener">X</a>`);
+  return undefined;
+}
+
+/**
+ * The public profile address on make.fun.
+ * @param {string} handle
+ * @returns {string}
+ */
+function profileAddress(handle) {
+  return `${MAKEFUN_ORIGIN}/u/${encodeURIComponent(handle)}`;
+}
+
+/**
+ * A 90 percent interval from a profile record, if one is present.
+ * @param {any} record
+ * @returns {string}
+ */
+function intervalText(record) {
+  const interval = pick(record, ['interval']);
+  if (!interval) return '';
+  const low = toNumber(pick(interval, ['low']));
+  const high = toNumber(pick(interval, ['high']));
+  if (low === null || high === null) return '';
+  return `${formatNumber(low)} – ${formatNumber(high)}`;
+}
+
+/**
+ * The identity card: avatar, handle, verification, bio and the make.fun link.
+ * @param {any} profile
+ * @param {string} handle
+ * @returns {HTMLElement}
+ */
+function identityCard(profile, handle) {
+  const card = el('section', 'panel identity-card');
+  const top = el('div', 'identity-top');
+  const avatar = document.createElement('img');
+  avatar.className = 'identity-avatar';
+  avatar.alt = '';
+  avatar.width = 64;
+  avatar.height = 64;
+  avatar.decoding = 'async';
+  const rawSource = pick(profile, ['image', 'avatar', 'avatar_url']);
+  const source = rawSource && typeof rawSource === 'object'
+    ? pick(rawSource, ['url', 'url_small'])
+    : rawSource;
+  if (typeof source === 'string' && source) {
+    avatar.crossOrigin = 'anonymous';
+    avatar.src = source.startsWith('/') ? `${MAKEFUN_ORIGIN}${source}` : source;
   }
-  const walletUrl = asAddress(card.walletUrl);
-  if (walletUrl) links.push(`<a href="${escapeHtml(walletUrl)}" rel="noopener">Wallet</a>`);
-  else if (card.wallet) links.push(`<a href="https://explorer.solana.com/address/${encodeURIComponent(String(card.wallet))}" rel="noopener">Wallet</a>`);
-  if (!links.length) return '';
-  const separator = '<span class="muted" aria-hidden="true">·</span>';
-  return `<div class="profile-links">${links.join(separator)}</div>`;
-}
-
-function headerCard(card, pageUrl, profilePayload) {
-  const image = safeImageUrl(card.image);
-  const avatar = image
-    ? `<img class="profile-avatar" crossorigin="anonymous" alt="" src="${escapeHtml(image)}">`
-    : '<div class="profile-avatar" aria-hidden="true"></div>';
-  const name = card.displayName && card.displayName !== card.handle
-    ? `<p class="profile-name">${escapeHtml(String(card.displayName))}</p>`
-    : '';
-  const bio = card.bio ? `<p class="profile-bio">${escapeHtml(String(card.bio))}</p>` : '';
-  return `<section class="profile-card">${avatar}
-    <h1 class="profile-handle">@${escapeHtml(card.handle)}${verifiedMarkup(profilePayload)}</h1>${name}${bio}
-    <p class="button-row"><a class="button button-primary" href="${escapeHtml(profileLink(card, pageUrl))}" rel="noopener">View on make.fun</a></p>
-    ${linkMarkup(card)}${statBoxes(card.record)}</section>`;
-}
-
-function competitionTitle(solution) {
-  const competition = pickFirst(solution, ['competition', 'competitions']);
-  if (competition && typeof competition === 'object') {
-    return String(pickFirst(competition, ['title', 'name']) ?? 'a bounty');
+  top.append(avatar);
+  const names = el('div');
+  const heading = el('h1', 'identity-handle');
+  heading.append(document.createTextNode(String(handle)));
+  const verified = pick(profile, ['verified', 'is_verified']);
+  if (verified === true) {
+    const check = el('span', 'verified', '✓');
+    check.title = 'Verified builder';
+    heading.append(check);
   }
-  return String(pickFirst(solution, ['competition_title', 'competitionTitle', 'competition', 'title']) ?? 'a bounty');
-}
+  names.append(heading);
+  const display = pick(profile, ['display_name', 'displayName', 'name']);
+  if (display && String(display) !== handle) names.append(el('p', 'muted', String(display)));
+  top.append(names);
+  card.append(top);
 
-function solutionDate(solution) {
-  return pickFirst(solution, ['entered_at', 'enteredAt', 'created_at', 'createdAt', 'date']);
-}
+  const bio = pick(profile, ['bio']);
+  if (bio) card.append(el('p', 'identity-bio', firstLine(bio, 240)));
+  const joined = pick(profile, ['joined', 'joined_at', 'created_at']);
+  if (joined) card.append(el('p', 'identity-bio', `Joined ${formatDate(joined)}`));
+  card.append(link(profileAddress(handle), 'View on make.fun', 'btn btn-primary'));
 
-function payoutDate(payout) {
-  return pickFirst(payout, ['paid_at', 'paidAt', 'date', 'created_at']);
-}
-
-function payoutAmount(payout) {
-  const value = pickFirst(payout, ['amount_usd', 'amount', 'prize_usd']);
-  return value === undefined ? null : value;
-}
-
-function activityEvents(card) {
-  const events = [];
-  for (const solution of asList(card.solutions)) {
-    const at = solutionDate(solution);
-    if (!at) continue;
-    events.push({ kind: 'Entered', title: competitionTitle(solution), at, time: Date.parse(at) });
-  }
-  for (const payout of asList(card.payouts)) {
-    const at = payoutDate(payout);
-    if (!at) continue;
-    const amount = payoutAmount(payout);
-    events.push({ kind: 'Won', title: competitionTitle(payout), at, amount: amount === null ? null : formatMoney(amount), time: Date.parse(at) });
-  }
-  return events.filter((event) => Number.isFinite(event.time)).sort((left, right) => right.time - left.time).slice(0, RECENT_LIMIT);
-}
-
-function activityCard(card) {
-  const events = activityEvents(card);
-  const body = events.length
-    ? `<div class="activity-list">${events.map((event) => `<div class="activity-item">
-        <p><strong>${event.kind}</strong> ${escapeHtml(event.title)}${event.amount ? ` · <span class="payout-amount">${escapeHtml(event.amount)}</span>` : ''}</p>
-        <span class="activity-time" title="${escapeHtml(formatDate(event.at))}">${escapeHtml(formatRelativeTime(event.at))}</span></div>`).join('')}</div>`
-    : '<p class="card-note">No dated activity has been published for this account yet.</p>';
-  return `<section class="card"><div class="card-head activity-head"><h2>Recent Activity</h2><span class="card-note">Latest public events</span></div>${body}</section>`;
-}
-
-function scoreOfSolution(solution) {
-  const score = pickFirst(solution, ['score', 'result']);
-  if (score === undefined) return MISSING;
-  return formatSolutionScore(score);
-}
-
-function prizeOfSolution(solution) {
-  const prize = solution?.prize_usd;
-  return prize === undefined || prize === null ? MISSING : formatPrize(prize);
-}
-
-function entriesTable(card) {
-  const rows = asList(card.solutions).slice().sort((left, right) => {
-    const leftPlace = toFiniteNumber(pickFirst(left, ['placement', 'place', 'rank']));
-    const rightPlace = toFiniteNumber(pickFirst(right, ['placement', 'place', 'rank']));
-    if (leftPlace === null && rightPlace === null) return 0;
-    if (leftPlace === null) return 1;
-    if (rightPlace === null) return -1;
-    return leftPlace - rightPlace;
-  });
-  if (!rows.length) return '<p class="card-note">This account has no published entries yet.</p>';
-  const body = rows.map((solution) => {
-    const competition = pickFirst(solution, ['competition', 'competitions']);
-    const slug = String(pickFirst(solution, ['competition_slug', 'competitionSlug', 'slug']) ?? pickFirst(competition ?? {}, ['slug']) ?? '');
-    const title = competitionTitle(solution);
-    const entryTitle = String(pickFirst(solution, ['title', 'entry_title', 'entryTitle']) ?? MISSING);
-    const placement = formatPlacement(pickFirst(solution, ['placement', 'place', 'rank']));
-    return `<tr><td><a class="bounty-title" href="#/bounty/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></td>
-      <td>${escapeHtml(entryTitle)}</td><td class="num placement">${placement === MISSING ? MISSING : `#${placement}`}</td>
-      <td class="num prize-cell">${escapeHtml(prizeOfSolution(solution))}</td><td class="num">${escapeHtml(scoreOfSolution(solution))}</td>
-      <td><span class="mono-date">${escapeHtml(formatDate(solutionDate(solution)))}</span></td></tr>`;
-  }).join('');
-  return `<div class="table-wrap"><table class="data-table entries-table"><thead><tr><th>Bounty</th><th>Entry</th><th class="num">Place</th><th class="num">Prize</th><th class="num">Score</th><th>Entered</th></tr></thead><tbody>${body}</tbody></table></div>`;
-}
-
-function payoutLink(payout) {
-  const explorer = asAddress(pickFirst(payout, ['explorer', 'explorer_url', 'explorerUrl', 'tx_url', 'txUrl', 'url']));
-  if (explorer) return explorer;
-  const signature = pickFirst(payout, ['signature', 'tx', 'transaction']);
-  return signature ? `https://explorer.solana.com/tx/${encodeURIComponent(String(signature))}` : '';
-}
-
-function payoutsTable(card) {
-  const rows = asList(card.payouts);
-  if (!rows.length) return '<p class="card-note">No prizes have been paid to this account yet.</p>';
-  const body = rows.map((payout) => {
-    const competition = pickFirst(payout, ['competition', 'competitions']);
-    const slug = String(pickFirst(payout, ['competition_slug', 'competitionSlug', 'slug']) ?? pickFirst(competition ?? {}, ['slug']) ?? '');
-    const title = competitionTitle(payout);
-    const place = formatPlacement(pickFirst(payout, ['place', 'placement', 'rank']));
-    const amount = payoutAmount(payout);
-    const link = payoutLink(payout);
-    return `<tr><td><span class="mono-date">${escapeHtml(formatDate(payoutDate(payout)))}</span></td>
-      <td class="num placement">${place === MISSING ? MISSING : `#${place}`}</td>
-      <td><a class="bounty-title" href="#/bounty/${encodeURIComponent(slug)}">${escapeHtml(title)}</a></td>
-      <td class="num payout-amount">${amount === null ? MISSING : escapeHtml(formatMoney(amount))}</td>
-      <td>${link ? `<a class="tx-link" href="${escapeHtml(link)}" rel="noopener">Transaction</a>` : `<span class="tx-link">${escapeHtml(shortenAddress(pickFirst(payout, ['signature', 'tx']), 5))}</span>`}</td></tr>`;
-  }).join('');
-  return `<div class="table-wrap"><table class="data-table payouts-table"><thead><tr><th>Date</th><th class="num">Place</th><th>Bounty</th><th class="num">Amount</th><th>Transaction</th></tr></thead><tbody>${body}</tbody></table></div>`;
-}
-
-function missingCard(handle) {
-  return `<div class="empty-state"><h2>No profile for @${escapeHtml(handle)}</h2>
-    <p>make.fun has no public record for that handle. Check the spelling, or find the builder on the leaderboard.</p>
-    <p><a class="button button-primary" href="#/">Explore the board</a></p></div>`;
-}
-
-export async function renderProfile(root, context) {
-  const handle = String(context.route?.handle ?? '');
-  context.setTitle(handle ? `@${handle}` : 'Profile');
-  root.innerHTML = `<p class="loading-line">Loading the profile…</p>`;
-
-  const result = await loadProfile(handle);
-  if (!context.isActive()) return;
-
-  if (!result.data) {
-    if (result.error?.status === 404) {
-      root.innerHTML = missingCard(handle);
-      return;
+  const record = pick(profile, ['record', 'stats']) ?? {};
+  const boxes = el('div', 'stat-boxes');
+  const values = [
+    [DASH_LABELS.entered, pick(record, ['competitions_entered', 'entered', 'competitions'])],
+    [DASH_LABELS.placed, pick(record, ['competitions_placed', 'placed'])],
+    [DASH_LABELS.won, pick(record, ['competitions_won', 'won'])],
+    [DASH_LABELS.best, pick(record, ['best_placement', 'best_place', 'best'])],
+    [DASH_LABELS.rewards, pick(record, ['prize_usd', 'prize_dollars', 'rewards', 'total_rewards'])],
+  ];
+  for (const [label, raw] of values) {
+    const box = el('div', 'stat-box');
+    box.append(el('span', 'label', label));
+    let text = DASH;
+    if (raw !== undefined && raw !== null) {
+      if (label === DASH_LABELS.best) text = formatPlacement(raw);
+      else if (label === DASH_LABELS.rewards) text = formatMoney(raw);
+      else text = formatNumber(raw);
     }
-    root.innerHTML = `<div class="empty-state"><h2>The profile could not load</h2>
-      <p>The make.fun API did not answer just now. Try again shortly.</p>
-      <p><a class="button button-primary" href="#/user/${encodeURIComponent(handle)}">Reload this profile</a></p></div>`;
-    return;
+    box.append(el('span', 'value', text));
+    boxes.append(box);
   }
+  card.append(boxes);
 
-  const card = result.card ?? readProfileCard(result.data);
-  if (!card.handle) {
-    root.innerHTML = missingCard(handle);
-    return;
+  const linksRow = el('div', 'link-row');
+  const addLink = (label, href) => linksRow.append(link(href, label));
+  const github = pick(profile, ['github_login', 'github']);
+  if (github) addLink('GitHub', `https://github.com/${encodeURIComponent(String(github))}`);
+  const discord = pick(profile, ['discord', 'discord_handle']);
+  if (discord) addLink('Discord', String(discord).startsWith('http') ? String(discord) : `https://discord.com/users/${encodeURIComponent(String(discord))}`);
+  const x = pick(profile, ['x_handle', 'x', 'twitter']);
+  if (x) addLink('X', `https://x.com/${encodeURIComponent(String(x).replace(/^@/, ''))}`);
+  const explorer = pick(profile, ['explorer_address', 'explorer']);
+  if (explorer) addLink('Wallet', String(explorer));
+  const interval = intervalText(record);
+  if (linksRow.children.length > 0 || interval) {
+    if (interval) linksRow.append(el('span', 'muted', `90% interval ${interval}`));
+    card.append(linksRow);
   }
-  context.setTitle(`@${card.handle}`);
-  const stale = result.stale ? '<div class="notice">Showing the last saved profile while a fresh copy arrives.</div>' : '';
-  const profilePayload = result.data?.profile && typeof result.data.profile === 'object' ? result.data.profile : result.data;
-  const pageUrl = pickFirst(result.data, ['page', 'url', 'profile_url', 'profileUrl'])
-    ?? pickFirst(profilePayload ?? {}, ['page', 'url', 'profile_url', 'profileUrl']);
-  root.innerHTML = `${stale}<div class="profile-layout">${headerCard(card, pageUrl, profilePayload)}${activityCard(card)}</div>
-    <section class="card"><div class="card-head"><h2>Entries</h2><span class="card-note">${formatNumber(card.solutions.length)} published</span></div>${entriesTable(card)}</section>
-    <section class="card"><div class="card-head"><h2>Payouts</h2><span class="card-note">Paid prizes</span></div>${payoutsTable(card)}</section>
-    <div class="motivational-strip"><p>Keep building, keep competing!</p><a class="button button-primary" href="#/">Explore Bounties</a></div>`;
+  return card;
 }
+
+/**
+ * The competition name from an activity record: the reply nests it as an
+ * object, so read its title, never interpolate the object itself.
+ * @param {any} item
+ * @returns {string|null}
+ */
+function activityName(item) {
+  const value = pick(item, ['competition_title', 'competition', 'bounty']);
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') {
+    const title = pick(value, ['title', 'name', 'slug']);
+    return typeof title === 'string' ? title : null;
+  }
+  const title = pick(item, ['title', 'name']);
+  return typeof title === 'string' ? title : null;
+}
+
+/**
+ * The five most recent real events from the solutions and payouts lists.
+ * @param {any} profile
+ * @returns {HTMLElement[]}
+ */
+function recentActivity(profile) {
+  const solutions = pick(profile, ['solutions', 'entries']);
+  const payouts = pick(profile, ['payouts', 'claimed']);
+  const events = [];
+  if (Array.isArray(solutions)) {
+    for (const solution of solutions) {
+      const moment = pick(solution, ['entered', 'entered_at', 'created_at', 'submitted_at']);
+      if (!moment) continue;
+      events.push({
+        kind: 'Entered',
+        competition: String(activityName(solution) ?? 'a bounty'),
+        moment,
+      });
+    }
+  }
+  if (Array.isArray(payouts)) {
+    for (const payout of payouts) {
+      const moment = pick(payout, ['paid', 'paid_at', 'date']);
+      if (!moment) continue;
+      events.push({
+        kind: 'Won',
+        competition: String(activityName(payout) ?? 'a bounty'),
+        moment,
+        amount: pick(payout, ['amount_usd', 'amount', 'amount_dollars']),
+      });
+    }
+  }
+  events.sort((left, right) => Date.parse(right.moment) - Date.parse(left.moment));
+  return events.slice(0, ACTIVITY_LIMIT).map((event) => {
+    const row = el('div', 'activity-row');
+    const phrase = el('div');
+    phrase.append(el('span', `activity-kind${event.kind === 'Won' ? ' is-win' : ''}`, event.kind));
+    phrase.append(document.createTextNode(event.competition));
+    if (event.kind === 'Won' && event.amount !== undefined) {
+      phrase.append(document.createTextNode(` · ${formatMoney(event.amount)}`));
+    }
+    row.append(phrase);
+    row.append(el('time', 'activity-when', formatDateTime(event.moment)));
+    return row;
+  });
+}
+
+/**
+ * The metric a solution's score belongs to, from its own column descriptor.
+ * @param {any} solution
+ * @returns {{key?: string, title?: string, unit?: string}|null}
+ */
+function solutionMetric(solution) {
+  const column = pick(solution, ['column', 'score_column', 'scoreColumn', 'metric']);
+  const score = pick(solution, ['score']);
+  const descriptor = (column && typeof column === 'object' ? column : null)
+    ?? (score && typeof score === 'object'
+      ? (pick(score, ['column', 'descriptor', 'metric']) ?? { key: String(pick(score, ['key']) ?? '') })
+      : null);
+  if (!descriptor) return null;
+  if (descriptor.unit) return descriptor;
+  const title = String(pick(descriptor, ['title']) ?? '');
+  const unit = title.match(/\(([^,)]+)/)?.[1]?.trim() ?? '';
+  return unit ? { ...descriptor, unit } : descriptor;
+}
+
+/**
+ * A solution's raw score value, whether the reply nests it or not.
+ * @param {any} solution
+ * @returns {any}
+ */
+function solutionValue(solution) {
+  const score = pick(solution, ['score']);
+  if (score && typeof score === 'object') return pick(score, ['value', 'display', 'score']);
+  return score;
+}
+
+/**
+ * Rows sorted best placement first, unresolved entries last.
+ * @param {any} profile
+ * @returns {any[]}
+ */
+function sortedSolutions(profile) {
+  const solutions = pick(profile, ['solutions', 'entries']);
+  if (!Array.isArray(solutions)) return [];
+  return [...solutions].sort((left, right) => {
+    const a = toNumber(pick(left, ['placement']));
+    const b = toNumber(pick(right, ['placement']));
+    if (a === null && b === null) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return a - b;
+  });
+}
+
+/**
+ * The entries table: title, entry, placement, prize, score and date.
+ * @param {any} profile
+ * @returns {HTMLElement}
+ */
+function entriesTable(profile) {
+  const solutions = sortedSolutions(profile);
+  if (solutions.length === 0) {
+    return emptyNote('No entries yet. Every builder starts with the first one.');
+  }
+  const wrap = el('div', 'table-wrap');
+  const table = el('table', 'rank-table entries-table');
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const label of ['Competition', 'Entry', 'Placement', 'Prize', 'Score', 'Entered']) {
+    const th = el('th', '', label);
+    th.scope = 'col';
+    headRow.append(th);
+  }
+  thead.append(headRow);
+  const tbody = el('tbody');
+  for (const solution of solutions) {
+    const tr = el('tr');
+    const competition = el('td');
+    const bounty = pick(solution, ['competition']) ?? {};
+    const slug = String(pick(bounty, ['slug']) ?? pick(solution, ['competition_slug']) ?? '');
+    const title = String(pick(bounty, ['title']) ?? pick(solution, ['competition_title']) ?? DASH);
+    competition.append(slug ? link(`#/bounty/${encodeURIComponent(slug)}`, title) : document.createTextNode(title));
+    tr.append(competition);
+    tr.append(el('td', '', String(pick(solution, ['title', 'submission_title']) ?? DASH)));
+    tr.append(el('td', 'num-cell', formatPlacement(pick(solution, ['placement']))));
+    const prize = pick(solution, ['prize_usd', 'prize_dollars', 'prize', 'amount']);
+    tr.append(el('td', 'num-cell', prize === undefined ? DASH : formatMoney(prize)));
+    tr.append(el('td', 'num-cell', formatScore(solutionValue(solution), solutionMetric(solution))));
+    const entered = pick(solution, ['entered', 'entered_at', 'created_at', 'submitted_at']);
+    tr.append(el('td', 'num-cell', entered ? formatDate(entered) : DASH));
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  wrap.append(table);
+  return wrap;
+}
+
+/**
+ * The payouts panel: one real paid prize per row with its explorer link.
+ * @param {any} profile
+ * @returns {HTMLElement}
+ */
+function payoutsPanel(profile) {
+  const payouts = pick(profile, ['payouts', 'claimed']);
+  if (!Array.isArray(payouts) || payouts.length === 0) {
+    return emptyNote('No payouts yet. Paid prizes appear here with their explorer receipt.');
+  }
+  const rows = [...payouts].sort((left, right) => (
+    Date.parse(pick(right, ['paid', 'paid_at', 'date']) ?? '') - Date.parse(pick(left, ['paid', 'paid_at', 'date']) ?? '')
+  ));
+  const wrap = el('div', 'table-wrap');
+  const table = el('table', 'rank-table payouts-table');
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const label of ['Date', 'Place', 'Competition', 'Amount', 'Transaction']) {
+    const th = el('th', '', label);
+    th.scope = 'col';
+    headRow.append(th);
+  }
+  thead.append(headRow);
+  const tbody = el('tbody');
+  for (const payout of rows) {
+    const tr = el('tr');
+    const paid = pick(payout, ['paid', 'paid_at', 'date']);
+    tr.append(el('td', 'num-cell', paid ? formatDate(paid) : DASH));
+    tr.append(el('td', 'num-cell', formatPlacement(pick(payout, ['place', 'placement']))));
+    const competitionCell = el('td');
+    const slug = String(pick(payout, ['competition_slug']) ?? '');
+    const title = String(pick(payout, ['competition_title', 'competition']) ?? DASH);
+    competitionCell.append(slug ? link(`#/bounty/${encodeURIComponent(slug)}`, title) : document.createTextNode(title));
+    tr.append(competitionCell);
+    tr.append(el('td', 'amount num-cell', formatMoney(pick(payout, ['amount', 'amount_dollars']))));
+    const explorer = pick(payout, ['explorer_address', 'explorer_url']);
+    const signature = pick(payout, ['signature']);
+    const transaction = el('td');
+    if (explorer) transaction.append(link(String(explorer), 'Explorer', 'num-cell'));
+    else if (signature) transaction.append(document.createTextNode(String(signature).slice(0, 12)));
+    else transaction.append(document.createTextNode(DASH));
+    tr.append(transaction);
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  wrap.append(table);
+  return wrap;
+}
+
+/**
+ * A friendly page for a handle the API does not know.
+ * @param {HTMLElement} root
+ * @param {string} handle
+ * @param {import('../main.js').ViewContext} context
+ */
+function noProfile(root, handle, context) {
+  const panel = el('section', 'panel route-error');
+  panel.append(el('h1', 'page-title', 'No profile'));
+  panel.append(el('p', 'muted', `make.fun has no public profile for @${handle}. Check the handle and try again.`));
+  const retry = el('button', 'btn btn-secondary', 'Try again');
+  retry.type = 'button';
+  retry.addEventListener('click', () => context.navigate(`#/user/${encodeURIComponent(handle)}`));
+  const board = link('#/', 'Back to the board', 'btn btn-primary');
+  panel.append(retry, board);
+  root.replaceChildren(panel);
+}
+
+/**
+ * Render one profile route.
+ * @param {import('../main.js').ViewContext} context
+ * @returns {Promise<() => void>}
+ */
+export async function renderProfile(context) {
+  const handle = context.route.handle;
+  const root = context.root;
+  root.replaceChildren(el('div', 'sk'));
+  let result;
+  try {
+    result = await getBuilderProfile(handle);
+  } catch (error) {
+    if (error?.status === 404) {
+      context.setTitle('No profile');
+      document.title = 'make.fun — No profile';
+      noProfile(root, handle, context);
+      context.markReady();
+      return () => {};
+    }
+    throw error;
+  }
+  const profile = result.data ?? {};
+  const shown = String(pick(profile, ['handle']) ?? handle);
+  context.setTitle(`${shown} profile`);
+  document.title = `make.fun — ${shown} profile`;
+  if (result.stale) window.dispatchEvent(new CustomEvent('potscope:stale'));
+
+  const page = el('div', 'profile-page');
+  const grid = el('div', 'profile-grid');
+  grid.append(identityCard(profile, shown));
+
+  const activity = el('section', 'panel activity-card');
+  activity.append(el('h2', 'section-title', 'Recent activity'));
+  const events = recentActivity(profile);
+  if (events.length === 0) activity.append(emptyNote('No activity has been recorded for this builder yet.'));
+  else activity.append(...events);
+  grid.append(activity);
+  page.append(grid);
+
+  const bottom = el('div', 'bottom-cards');
+  bottom.append(sectionBlock('Entries', entriesTable(profile), 'Best placement first', 'panel card'));
+  bottom.append(sectionBlock('Payouts', payoutsPanel(profile), 'Paid prizes', 'panel card'));
+  page.append(bottom);
+
+  const strip = el('div', 'motivation');
+  strip.append(el('p', '', 'Keep building, keep competing!'));
+  strip.append(link('#/', 'Explore Bounties', 'btn btn-primary'));
+  page.append(strip);
+
+  root.replaceChildren(page);
+  context.markReady();
+  return () => {};
+}
+
