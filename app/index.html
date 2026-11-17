@@ -1,66 +1,19 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light" />
-    <meta name="theme-color" content="#ffffff" />
-    <meta name="description" content="PotScope tracks make.fun bounties, live pots, entry fees, rewards, leaderboards, and builder profiles from the public make.fun API." />
-    <title>make.fun · Bounty Board</title>
-    <link rel="icon" type="image/png" href="logo.png" />
-    <link rel="stylesheet" href="style.css" />
-  </head>
-  <body>
-    <a class="skip-link" href="#view">Skip to content</a>
-
-    <header class="site-header">
-      <div class="header-inner">
-        <a class="brand" href="#/" aria-label="make.fun bounty board">
-          <img class="brand-logo" src="logo.png" alt="make.fun" width="28" height="28" />
-          <span class="brand-wordmark">make.fun</span>
-        </a>
-        <nav class="site-nav" aria-label="Primary">
-          <a href="#/" data-nav="board">Bounties</a>
-          <a href="#/builders" data-nav="builders">Top builders</a>
-        </nav>
-        <form class="search" id="search-form" role="search" autocomplete="off">
-          <label class="visually-hidden" for="search-input">Search bounties or handles</label>
-          <input id="search-input" name="q" type="search" placeholder="Search bounties or handles" spellcheck="false" />
-          <button type="submit" class="search-submit" aria-label="Search">
-            <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true" focusable="false">
-              <circle cx="8.5" cy="8.5" r="5.25" fill="none" stroke="currentColor" stroke-width="2" />
-              <line x1="12.4" y1="12.4" x2="17" y2="17" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
-            </svg>
-          </button>
-        </form>
-        <time class="live-clock" id="clock" aria-label="Current time">00:00:00</time>
-      </div>
-    </header>
-
-    <div class="ticker" id="ticker" hidden>
-      <div class="ticker-inner">
-        <span class="ticker-label">Live</span>
-        <p class="ticker-line" id="ticker-line" aria-live="off">Loading the latest entries…</p>
-      </div>
-    </div>
-
-    <main class="site-main" id="main">
-      <div class="view" id="view" tabindex="-1">
-        <p class="loading-line">Loading the board…</p>
-      </div>
-    </main>
-
-    <footer class="site-footer">
-      <div class="footer-inner">
-        <p>PotScope reads the public <a href="https://make.fun">make.fun</a> API. Every figure on this page is live data.</p>
-        <p class="footer-links">
-          <a href="#/">Board</a>
-          <a href="#/builders">Top builders</a>
-          <a href="https://make.fun">make.fun</a>
-        </p>
-      </div>
-    </footer>
-
-    <script type="module" src="main.js"></script>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>make.fun — Bounty Board</title>
+<meta name="description" content="PotScope: a live make.fun frontend for bounties, leaderboards and builder profiles.">
+<link rel="icon" href="logo.png">
+<style>:root{color-scheme:dark}body{margin:0;background:#08090a;color:#f5f1e8;font:16px/1.5 system-ui,sans-serif;overflow-wrap:break-word}.r{max-width:1440px;margin:0 auto;padding:0 16px}header{border-bottom:1px solid #292c2f}.skip{position:absolute;left:-9999px}.skip:focus{left:8px;top:8px;z-index:9;background:#c8f751;color:#08090a;padding:8px}.sk{height:120px;margin:16px 0;border:1px solid #25282b;border-radius:8px;background:#131517;animation:sk 1.2s ease-in-out infinite}@keyframes sk{50%{opacity:.4}}@media(prefers-reduced-motion:reduce){.sk{animation:none}}</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header id="site-header"></header>
+<div id="ticker-slot" class="r" aria-live="polite"></div>
+<main id="main" class="r" tabindex="-1"><div class="sk"></div><div class="sk"></div></main>
+<footer id="site-footer" class="r"></footer>
+<script type="module">window.__shotReady=false;import('./main.js').catch(function(e){var m=document.getElementById('main');m.textContent='The app could not load. '+e.message});</script>
+</body>
 </html>
