@@ -1,30 +1,53 @@
 # PotScope
 
-PotScope is a fast, static read of the public make.fun API: a live bounty board, each bounty's page and leaderboard, and any builder's public profile, all rendered from live data with no framework, no build step, and no sign-in.
-
 [![make.fun competition badge](https://make.fun/badge/makefun-frontend-01.svg)](https://make.fun/bounty/makefun-frontend-01)
 
 [![make.fun rank badge](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/rank.svg)](https://make.fun/bounty/makefun-frontend-01)
 
 [![make.fun reward badge](https://make.fun/badge/makefun-frontend-01/fadliferdian28/makefun-frontend-01/reward.svg)](https://make.fun/bounty/makefun-frontend-01)
 
+PotScope is a static frontend for [make.fun](https://make.fun): a live bounty
+board with a split view, each bounty's detail page and leaderboard, a builder
+profile and the top builders ranking. It reads the public make.fun API in the
+browser; there is no build step, no framework and no web font.
+
 ## Run it
 
 ```sh
-node serve.ts            # http://127.0.0.1:8080
-node serve.ts --port 9000
+node serve.ts                 # http://127.0.0.1:8080
+node serve.ts --port 9000     # another port
 ```
 
-The server serves `app/` on the loopback address. To package the entry with the dossier, run `MAKEFUN_OUTPUT_DIR=out node main.ts`.
+The server serves `app/` on the loopback address. Open the printed address and
+the board loads from the live API.
 
 ## Routes
 
-- `#/` — the bounty board: live, opening-soon, and closed bounties with live pot, fee, time left, entries, and value per entry.
-- `#/bounty/:slug` — one bounty: stat strip, tabs, rewards table with fee-share bars, dates, judging, rules, and a sidebar.
-- `#/bounty/:slug/leaderboard` — the full ranked leaderboard, 50 rows per page with search, medals, 90% intervals, prizes, and phase and view toggles.
-- `#/user/:handle` — a builder's profile: five stat boxes, recent activity, entries, and payouts.
-- `#/builders` — the top-builders surface.
+- `#/` — the bounty board, split view: table left, selected bounty right.
+- `#/bounty/<slug>` — one bounty's full page with tabs, rewards and judging.
+- `#/bounty/<slug>/leaderboard` — that bounty's ranked leaderboard.
+- `#/user/<handle>` — a builder's public profile.
+- `#/builders` — the top builders ranking, from the header navigation.
 
-## Performance
+Every route is a hash address, so a shared link or a refresh opens the right
+view; back and forward work.
 
-The first load is one HTML shell, one stylesheet, and the router plus the API and formatting modules: about 11 KB gzipped (level 9) across the shell, style sheet, and those statically imported modules. The board and bounty views, their shared view helper, the leaderboard and profile views, the detail API and formatting modules, and the detail stylesheet all load lazily: the board route still paints immediately, but that payload sits outside the first load. Every API response is cached in memory with its ETag: lists and leaderboards stay fresh for 60 seconds, detail and profiles for 5 minutes, and stale bodies keep rendering while a conditional request revalidates them, so repeat visits inside a window make zero requests and a full four-surface tour makes four.
+## Performance story
+
+The first load is a single file: `app/index.html`, **846 bytes gzip-9**
+(1 file, measured with `gzip -9` and the dossier's Totals line). It carries a
+small inline style block and a small inline module script that dynamic-imports
+the main module; the style sheet, the API client, the formatters and every view
+arrive afterwards through `import()`.
+
+API reads go through an in-memory cache keyed by request address, storing the
+JSON body, its ETag and the fetch time. Fresh entries (60 s for lists and
+leaderboards, 5 min for details and profiles) are served without a request;
+stale entries stay on screen while a conditional request revalidates them. The
+footer of every view prints the view's counted requests, cache hits and 304s,
+so the discipline is visible rather than claimed. A full tour of the four
+surfaces is four requests.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

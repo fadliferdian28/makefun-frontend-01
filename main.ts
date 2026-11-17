@@ -1,130 +1,179 @@
-// PotScope entrypoint: package the static frontend and its screenshots into the
-// output directory and write the dossier the scorer reads.
-//
-//   MAKEFUN_OUTPUT_DIR=out node main.ts
-//
-// Node 22, standard library only. The copy walk is sorted and copies bytes, so
-// two runs against the same repository produce identical output.
+/**
+ * PotScope submission entrypoint.
+ *
+ * Copies this repository's app/ and screenshots/ folders into the output
+ * directory the scorer hands us, then writes the dossier with the kit's
+ * vendored builder. The copy is deterministic: a sorted walk, byte-identical
+ * contents and no timestamps, so two runs produce two identical trees.
+ *
+ * Run it with `MAKEFUN_OUTPUT_DIR=out node main.ts`; the grader sets
+ * MAKEFUN_OUTPUT_DIR to /output.
+ */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-frontend.ts';
 
-const REPOSITORY_ROOT = dirname(fileURLToPath(import.meta.url));
-const OUTPUT_DIRECTORY = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const REPOSITORY_ROOT = fileURLToPath(new URL('.', import.meta.url));
+const OUTPUT_ROOT = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const APP_SOURCE = join(REPOSITORY_ROOT, 'app');
-const SHOTS_SOURCE = join(REPOSITORY_ROOT, 'screenshots');
+const APP_DIRECTORY = 'app';
+const SCREENSHOT_DIRECTORY = 'screenshots';
+const PENDING_FILE = 'dossier-pending.txt';
+const DOSSIER_FILE = 'dossier.json';
 
-const DOSSIER_LIMITS = {
-  text_max_bytes: 163_840,
-  screenshots: { max: 3, max_bytes: 262_144 },
-  app_max_files: 993,
-  app_max_bytes: 16_777_216,
-};
+const APP_MAX_FILES = 993;
+const APP_MAX_BYTES = 16_777_216;
+const SCREENSHOT_MAX = 3;
+const SCREENSHOT_MAX_BYTES = 262_144;
+const TEXT_MAX_BYTES = 163_840;
 
-type CopyTally = { files: number; bytes: number };
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg']);
 
-function listEntriesSorted(directory: string): string[] {
-  return readdirSync(directory, { withFileTypes: true })
-    .map((entry) => entry.name)
-    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
-}
+/** @typedef {{relativePath: string, bytes: number}} CopiedFile */
 
-// Recursively copy one source tree to one destination tree, visiting names in
-// sorted order and writing the same bytes the source holds. Symbolic links and
-// other special files are skipped: the submission gate refuses them anyway.
-function copyTree(source: string, destination: string, tally: CopyTally): void {
-  mkdirSync(destination, { recursive: true });
-  for (const name of listEntriesSorted(source)) {
-    const sourcePath = join(source, name);
-    const destinationPath = join(destination, name);
-    const stats = statSync(sourcePath);
+/**
+ * Every file below a directory, depth first in sorted order so the walk is
+ * the same on every machine.
+ * @param {string} directory Absolute directory to walk.
+ * @returns {string[]} Absolute file paths, sorted.
+ */
+function listFilesSorted(directory: string): string[] {
+  /** @type {string[]} */
+  const files: string[] = [];
+  for (const name of readdirSync(directory).sort(compareNames)) {
+    const full = join(directory, name);
+    const stats = statSync(full, { throwIfNoEntry: false });
+    if (!stats) continue;
     if (stats.isDirectory()) {
-      copyTree(sourcePath, destinationPath, tally);
+      files.push(...listFilesSorted(full));
     } else if (stats.isFile()) {
-      copyFileSync(sourcePath, destinationPath);
-      tally.files += 1;
-      tally.bytes += stats.size;
+      files.push(full);
     }
   }
+  return files;
 }
 
-function describeRepositoryPath(path: string): string {
-  const shown = relative(REPOSITORY_ROOT, path) || '.';
-  return shown.split('\\').join('/');
+/**
+ * @param {string} left
+ * @param {string} right
+ * @returns {number}
+ */
+function compareNames(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
-function hasScreenshots(): boolean {
-  if (!existsSync(SHOTS_SOURCE)) return false;
-  return listEntriesSorted(SHOTS_SOURCE).some((name) => {
-    const stats = statSync(join(SHOTS_SOURCE, name));
-    return stats.isFile();
-  });
+/**
+ * Copy one file's bytes to the output, creating parent folders first.
+ * @param {string} source Absolute source path.
+ * @param {string} destination Absolute destination path.
+ * @returns {number} Bytes written.
+ */
+function copyFileBytes(source: string, destination: string): number {
+  const bytes = readFileSync(source);
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, bytes);
+  return bytes.byteLength;
 }
 
-function writePendingNote(appTally: CopyTally, shotTally: CopyTally): void {
+/**
+ * Copy a whole folder with a sorted walk. A missing source still creates the
+ * destination, so the output always carries an app/ and a screenshots/ folder.
+ * @param {string} sourceDirectory Absolute folder inside the repository.
+ * @param {string} destinationDirectory Absolute folder in the output.
+ * @returns {CopiedFile[]}
+ */
+function copyTree(sourceDirectory: string, destinationDirectory: string): CopiedFile[] {
+  mkdirSync(destinationDirectory, { recursive: true });
+  if (!existsSync(sourceDirectory)) return [];
+  /** @type {CopiedFile[]} */
+  const copied: CopiedFile[] = [];
+  for (const file of listFilesSorted(sourceDirectory)) {
+    const target = join(destinationDirectory, relative(sourceDirectory, file));
+    const bytes = copyFileBytes(file, target);
+    copied.push({ relativePath: relative(REPOSITORY_ROOT, file).split(sep).join('/'), bytes });
+  }
+  return copied;
+}
+
+/**
+ * The screenshots the dossier may carry: image files, sorted by name.
+ * @param {string} directory Absolute screenshots folder in the output.
+ * @returns {string[]} File names, sorted.
+ */
+function listScreenshots(directory: string): string[] {
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => IMAGE_EXTENSIONS.has(extensionOf(name)))
+    .sort(compareNames);
+}
+
+/** @param {string} name */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot === -1 ? '' : name.slice(dot).toLowerCase();
+}
+
+/**
+ * The deterministic stand-in written while the screenshot session has not run
+ * yet. It lists the copied files so two runs can be compared byte for byte.
+ * @param {CopiedFile[]} appFiles
+ * @param {CopiedFile[]} screenshotFiles
+ * @returns {string}
+ */
+function pendingReport(appFiles: CopiedFile[], screenshotFiles: CopiedFile[]): string {
+  const appBytes = appFiles.reduce((total, file) => total + file.bytes, 0);
+  const shotBytes = screenshotFiles.reduce((total, file) => total + file.bytes, 0);
   const lines = [
     'PotScope dossier pending',
     '',
-    'No screenshots were present when this package was built, so no dossier.json',
-    'was written. Add three screenshots under screenshots/ and run the entrypoint',
-    'again to produce the dossier.',
+    'Screenshots are taken in session 3; no dossier.json is written yet.',
+    `app files: ${appFiles.length}`,
+    `app bytes: ${appBytes}`,
+    `screenshots: ${screenshotFiles.length}`,
+    `screenshot bytes: ${shotBytes}`,
     '',
-    `app files: ${appTally.files}`,
-    `app bytes: ${appTally.bytes}`,
-    `screenshot files: ${shotTally.files}`,
-    `screenshot bytes: ${shotTally.bytes}`,
+    'app/:',
+    ...appFiles.map((file) => `${file.bytes}\t${file.relativePath}`),
     '',
   ];
-  writeFileSync(join(OUTPUT_DIRECTORY, 'dossier-pending.txt'), lines.join('\n'));
+  return lines.join('\n');
 }
 
-function packageRepository(): void {
-  if (!existsSync(APP_SOURCE)) {
-    throw new Error(`the app directory is missing at ${describeRepositoryPath(APP_SOURCE)}`);
-  }
+/** Copy the app, copy what screenshots exist, then hand in the dossier. */
+function main(): void {
+  mkdirSync(OUTPUT_ROOT, { recursive: true });
 
-  mkdirSync(OUTPUT_DIRECTORY, { recursive: true });
+  const appFiles = copyTree(join(REPOSITORY_ROOT, APP_DIRECTORY), join(OUTPUT_ROOT, APP_DIRECTORY));
+  const screenshotFiles = copyTree(
+    join(REPOSITORY_ROOT, SCREENSHOT_DIRECTORY),
+    join(OUTPUT_ROOT, SCREENSHOT_DIRECTORY),
+  );
+  const outputScreenshots = join(OUTPUT_ROOT, SCREENSHOT_DIRECTORY);
+  const shots = listScreenshots(outputScreenshots);
 
-  const appTally: CopyTally = { files: 0, bytes: 0 };
-  const shotTally: CopyTally = { files: 0, bytes: 0 };
-
-  const appDestination = join(OUTPUT_DIRECTORY, 'app');
-  rmSync(appDestination, { recursive: true, force: true });
-  copyTree(APP_SOURCE, appDestination, appTally);
-
-  const shotsDestination = join(OUTPUT_DIRECTORY, 'screenshots');
-  rmSync(shotsDestination, { recursive: true, force: true });
-  mkdirSync(shotsDestination, { recursive: true });
-  const screenshotsReady = hasScreenshots();
-  if (screenshotsReady) copyTree(SHOTS_SOURCE, shotsDestination, shotTally);
-
-  const pendingPath = join(OUTPUT_DIRECTORY, 'dossier-pending.txt');
-  const dossierPath = join(OUTPUT_DIRECTORY, 'dossier.json');
-
-  if (!screenshotsReady) {
-    writePendingNote(appTally, shotTally);
-    if (existsSync(dossierPath)) rmSync(dossierPath);
+  if (shots.length === 0) {
+    writeFileSync(join(OUTPUT_ROOT, PENDING_FILE), pendingReport(appFiles, screenshotFiles), 'utf8');
+    const appBytes = appFiles.reduce((total, file) => total + file.bytes, 0);
     console.log(
-      `packaged ${appTally.files} app files (${appTally.bytes} bytes) and ${shotTally.files} screenshots; dossier pending (no screenshots yet)`,
+      `Packaged ${appFiles.length} app files (${appBytes} bytes) with no screenshots yet; wrote ${PENDING_FILE}.`,
     );
     return;
   }
 
-  writeFileSync(dossierPath, buildDossier(OUTPUT_DIRECTORY, DOSSIER_LIMITS));
-  if (existsSync(pendingPath)) rmSync(pendingPath);
-  const dossierBytes = statSync(dossierPath).size;
+  const dossier = buildDossier(OUTPUT_ROOT, {
+    text_max_bytes: TEXT_MAX_BYTES,
+    screenshots: { max: SCREENSHOT_MAX, max_bytes: SCREENSHOT_MAX_BYTES },
+    app_max_files: APP_MAX_FILES,
+    app_max_bytes: APP_MAX_BYTES,
+  });
+  writeFileSync(join(OUTPUT_ROOT, DOSSIER_FILE), dossier);
   console.log(
-    `packaged ${appTally.files} app files (${appTally.bytes} bytes), ${shotTally.files} screenshots (${shotTally.bytes} bytes), dossier ${dossierBytes} bytes`,
+    `Packaged ${appFiles.length} app files, ${shots.length} screenshot${shots.length === 1 ? '' : 's'}, and wrote ${DOSSIER_FILE}.`,
   );
 }
 
-try {
-  packageRepository();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`packaging failed: ${message}`);
-  process.exitCode = 1;
-}
+main();

@@ -1,107 +1,102 @@
-// Development server for the PotScope frontend: serves app/ on the loopback
-// address so the static build can be opened in a browser without a bundler.
-//
-//   node serve.ts             -> http://127.0.0.1:8080
-//   node serve.ts --port 9000 -> http://127.0.0.1:9000
-//
-// Node 22, standard library only. Requests are confined to app/: any resolved
-// path that escapes the directory is refused, and unknown files answer 404.
+/**
+ * A tiny static server for local development: serves the app/ folder on the
+ * loopback address, so a browser can open it without a build step.
+ *
+ * `node serve.ts` listens on http://127.0.0.1:8080 and `--port <n>` picks
+ * another port. It never leaves app/, never lists a directory, and sends the
+ * content types a browser needs. Node 22 standard library only.
+ */
 
 import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DOCUMENT_ROOT = resolve(fileURLToPath(new URL('./app', import.meta.url)));
-const LOOPBACK_ADDRESS = '127.0.0.1';
+const APP_ROOT = resolve(fileURLToPath(new URL('./app', import.meta.url)));
+const LOOPBACK = '127.0.0.1';
 const DEFAULT_PORT = 8080;
+const MAX_PORT = 65_535;
 
-const MIME_TYPES = new Map([
-  ['.html', 'text/html; charset=utf-8'],
-  ['.css', 'text/css; charset=utf-8'],
-  ['.js', 'text/javascript; charset=utf-8'],
-  ['.mjs', 'text/javascript; charset=utf-8'],
-  ['.json', 'application/json; charset=utf-8'],
-  ['.png', 'image/png'],
-  ['.jpg', 'image/jpeg'],
-  ['.jpeg', 'image/jpeg'],
-  ['.webp', 'image/webp'],
-  ['.gif', 'image/gif'],
-  ['.svg', 'image/svg+xml'],
-  ['.ico', 'image/x-icon'],
-  ['.txt', 'text/plain; charset=utf-8'],
-  ['.webmanifest', 'application/manifest+json'],
-]);
+const CONTENT_TYPES: Readonly<Record<string, string>> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8',
+  '.woff2': 'font/woff2',
+};
 
+/**
+ * Read `--port <n>` from the command line, falling back to the default.
+ * @param {string[]} argv Arguments after the script name.
+ * @returns {number}
+ */
 function readPort(argv: string[]): number {
-  const flagIndex = argv.indexOf('--port');
-  if (flagIndex === -1) return DEFAULT_PORT;
-  const candidate = Number(argv[flagIndex + 1]);
-  if (!Number.isInteger(candidate) || candidate < 1 || candidate > 65_535) return DEFAULT_PORT;
+  const flag = argv.indexOf('--port');
+  if (flag === -1) return DEFAULT_PORT;
+  const requested = Number(argv[flag + 1]);
+  if (!Number.isInteger(requested) || requested < 1 || requested > MAX_PORT) return DEFAULT_PORT;
+  return requested;
+}
+
+/**
+ * Resolve a request path inside app/, or null when it escapes the folder.
+ * @param {string} pathname Decoded request path.
+ * @returns {string|null}
+ */
+function resolveInsideApp(pathname: string): string | null {
+  const trailingSlash = pathname.endsWith('/');
+  const candidate = resolve(join(APP_ROOT, normalize(trailingSlash ? `${pathname}index.html` : pathname)));
+  if (candidate !== APP_ROOT && !candidate.startsWith(APP_ROOT + sep)) return null;
   return candidate;
 }
 
-function resolveRequestPath(rawPath: string): string | null {
-  let decoded: string;
+/** @param {string} pathname */
+function contentTypeFor(pathname: string): string {
+  return CONTENT_TYPES[extname(pathname).toLowerCase()] ?? 'application/octet-stream';
+}
+
+const port = readPort(process.argv.slice(2));
+
+createServer((request, response) => {
+  const url = new URL(request.url ?? '/', `http://${LOOPBACK}`);
+  let pathname: string;
   try {
-    decoded = decodeURIComponent(rawPath);
+    pathname = decodeURIComponent(url.pathname);
   } catch {
-    return null;
+    response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' }).end('bad request');
+    return;
   }
-  const withIndex = decoded.endsWith('/') ? `${decoded}index.html` : decoded;
-  const candidate = resolve(join(DOCUMENT_ROOT, normalize(withIndex)));
-  if (candidate !== DOCUMENT_ROOT && !candidate.startsWith(DOCUMENT_ROOT + sep)) return null;
-  return candidate;
-}
 
-// Exported so the request routing can be exercised in-process by tests and
-// sandboxes that forbid opening a listening socket.
-export function createRequestHandler() {
-  return (request: import('node:http').IncomingMessage, response: import('node:http').ServerResponse) => {
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      response.writeHead(405, { allow: 'GET, HEAD' }).end('method not allowed');
-      return;
-    }
+  const file = resolveInsideApp(pathname);
+  if (!file) {
+    response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' }).end('forbidden');
+    return;
+  }
 
-    const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1');
-    const filePath = resolveRequestPath(requestUrl.pathname);
-    if (!filePath) {
-      response.writeHead(400).end('bad request');
-      return;
-    }
+  const stats = statSync(file, { throwIfNoEntry: false });
+  if (!stats || !stats.isFile()) {
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found');
+    return;
+  }
 
-    let size: number;
-    try {
-      const stats = statSync(filePath);
-      if (!stats.isFile()) throw new Error('not a file');
-      size = stats.size;
-    } catch {
-      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found');
-      return;
-    }
-
-    const contentType = MIME_TYPES.get(extname(filePath).toLowerCase()) ?? 'application/octet-stream';
-    const headers = {
-      'content-type': contentType,
-      'content-length': String(size),
-      'cache-control': 'no-cache',
-      'x-content-type-options': 'nosniff',
-    };
-
-    if (request.method === 'HEAD') {
-      response.writeHead(200, headers).end();
-      return;
-    }
-    response.writeHead(200, headers);
-    createReadStream(filePath).pipe(response);
-  };
-}
-
-const direct = resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url);
-if (direct) {
-  const port = readPort(process.argv.slice(2));
-  const server = createServer(createRequestHandler());
-  server.listen(port, LOOPBACK_ADDRESS, () => {
-    console.log(`PotScope is serving app/ at http://${LOOPBACK_ADDRESS}:${port}`);
+  response.writeHead(200, {
+    'content-type': contentTypeFor(file),
+    'content-length': stats.size,
+    'cache-control': 'no-store',
   });
-}
+  if (request.method === 'HEAD') {
+    response.end();
+    return;
+  }
+  createReadStream(file).pipe(response);
+}).listen(port, LOOPBACK, () => {
+  console.log(`PotScope is on http://${LOOPBACK}:${port}`);
+});
